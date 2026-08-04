@@ -36,10 +36,10 @@ jobs:
           VERSION=$(cd node && npm version ${{ inputs.version }} --no-git-tag-version | tr -d v)
           (cd python && uv version "$VERSION")
           git commit -am "Release v$VERSION"
-          git tag "v$VERSION"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: Push commit and tag
-        run: git push origin main --follow-tags
+        run: git push origin main "v$VERSION"
       - name: Create GitHub release
         run: gh release create "v$VERSION" --generate-notes
         env:
