@@ -25,20 +25,31 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - uses: astral-sh/setup-uv@v5
       - name: Syntax check
-        run: node --check bin/harvis.js
-      - name: Bump version
+        run: node --check node/bin/harvis.js
+      - name: Bump versions
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          npm version ${{ inputs.version }} -m "Release v%s"
+          VERSION=$(cd node && npm version ${{ inputs.version }} --no-git-tag-version | tr -d v)
+          (cd python && uv version "$VERSION")
+          git commit -am "Release v$VERSION"
+          git tag "v$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: Push commit and tag
         run: git push origin main --follow-tags
       - name: Create GitHub release
-        run: gh release create "v$(node -p "require('./package.json').version")" --generate-notes
+        run: gh release create "v$VERSION" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Publish to npm
+        working-directory: node
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to PyPI
+        working-directory: python
+        run: |
+          uv build
+          uv publish

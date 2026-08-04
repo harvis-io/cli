@@ -1,0 +1,31 @@
+[project]
+name = "harvis"
+version = "0.0.2"
+description = "Deploy the current folder to harvis.dev with one command."
+readme = "README.md"
+authors = [
+    { name = "Fordnox", email = "fordnox@gmail.com" }
+]
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = []
+keywords = [
+    "harvis",
+    "hosting",
+    "free-hosting",
+    "static-hosting",
+    "deploy",
+    "static-site",
+    "cli",
+]
+
+[project.urls]
+Homepage = "https://harvis.dev"
+Repository = "https://github.com/harvis-io/cli"
+
+[project.scripts]
+harvis = "harvis.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
