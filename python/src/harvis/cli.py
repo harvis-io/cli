@@ -223,7 +223,11 @@ def post_json(url, payload):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            # The default Python-urllib user agent is rejected at the edge (403).
+            "User-Agent": f"harvis/{__version__}",
+        },
         method="POST",
     )
     try:
