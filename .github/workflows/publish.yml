@@ -23,12 +23,19 @@ jobs:
       - name: Syntax check
         run: node --check bin/harvis.js
       - name: Publish
-        run: npm publish --provenance --access public
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "harvis@$VERSION" version >/dev/null 2>&1; then
+            echo "harvis@$VERSION already on npm, skipping"
+          else
+            npm publish --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   pypi:
     runs-on: ubuntu-latest
+    environment: pypi
     permissions:
       contents: read
       id-token: write
