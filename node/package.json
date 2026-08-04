@@ -25,5 +25,8 @@
     "url": "git+https://github.com/harvis-io/cli.git"
   },
   "homepage": "https://harvis.dev",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
 }

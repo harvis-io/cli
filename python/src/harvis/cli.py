@@ -1,12 +1,16 @@
 """harvis — deploy the current folder to harvis.dev with one command."""
 
-import base64
+import io
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
+import zipfile
 from datetime import datetime, timezone
 
 from harvis import __version__
@@ -19,7 +23,9 @@ STATE_FILE = ".harvis.json"
 IGNORED_DIRS = {"node_modules", "__MACOSX"}
 IGNORED_FILES = {"Thumbs.db", "desktop.ini", STATE_FILE}
 
-TEXT_EXTENSIONS = {
+# Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
+# already compressed, so zipping them gains nothing.
+COMPRESSIBLE_EXTENSIONS = {
     ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
     ".json", ".map", ".txt", ".md", ".markdown", ".svg", ".xml", ".rss",
     ".atom", ".yml", ".yaml", ".csv", ".tsv", ".webmanifest", ".ini", ".toml",
@@ -117,6 +123,12 @@ def parse_args(argv):
     return args
 
 
+def is_compressible(name):
+    ext = os.path.splitext(name)[1].lower()
+    # Extensionless files (LICENSE, CNAME…) are almost always text.
+    return ext == "" or ext in COMPRESSIBLE_EXTENSIONS
+
+
 def collect_files(root_dir):
     files = []
     total_bytes = 0
@@ -144,12 +156,10 @@ def collect_files(root_dir):
                     buf = f.read()
                 total_bytes += len(buf)
                 rel_path = os.path.relpath(entry.path, root_dir).replace(os.sep, "/")
-                ext = os.path.splitext(entry.name)[1].lower()
-                is_text = ext in TEXT_EXTENSIONS
                 files.append({
                     "path": rel_path,
-                    "content": buf.decode("utf-8") if is_text else base64.b64encode(buf).decode("ascii"),
-                    "encoding": "text" if is_text else "base64",
+                    "data": buf,
+                    "compressible": is_compressible(entry.name),
                 })
                 if len(files) > MAX_FILES:
                     print(f"Too many files: the limit is {MAX_FILES} per site.", file=sys.stderr)
@@ -160,6 +170,142 @@ def collect_files(root_dir):
 
     walk(root_dir)
     return files, total_bytes
+
+
+def should_zip(files, total_bytes):
+    """Zip when deflating pays for itself: text shrinks ~60-70%, while already-
+    compressed media gains nothing, so a folder that is (almost) all media
+    uploads as raw multipart instead. A lone .zip file is always wrapped —
+    sent bare, the server would extract the file itself."""
+    if len(files) == 1 and re.search(r"\.zip$", files[0]["path"], re.IGNORECASE):
+        return True
+    compressible_bytes = sum(len(f["data"]) for f in files if f["compressible"])
+    return compressible_bytes >= total_bytes * 0.1
+
+
+def build_zip(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for f in files:
+            if f["compressible"]:
+                zf.writestr(zipfile.ZipInfo(f["path"]), f["data"], zipfile.ZIP_DEFLATED, 6)
+            else:
+                zf.writestr(zipfile.ZipInfo(f["path"]), f["data"], zipfile.ZIP_STORED)
+    return buf.getvalue()
+
+
+def build_multipart(files, fields):
+    boundary = "----harvis" + uuid.uuid4().hex
+    parts = []
+    for key, value in fields.items():
+        if not value:
+            continue
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode("utf-8")
+        )
+    for f in files:
+        # The paired "paths" field is the source of truth for the relative
+        # path; the filename only needs to be a safe label.
+        label = f["path"].split("/")[-1].replace('"', "_").replace("\r", "_").replace("\n", "_")
+        parts.append(
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{label}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+        )
+        parts.append(f["data"])
+        parts.append(
+            f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="paths"\r\n\r\n{f["path"]}\r\n'.encode("utf-8")
+        )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def fmt_bytes(n):
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+class _Progress:
+    """Renders on stderr only when it is an interactive terminal, so pipes
+    and CI logs stay clean."""
+
+    def __init__(self, total):
+        self.total = total
+        self.sent = 0
+        self.enabled = sys.stderr.isatty()
+        self._last = ""
+
+    def update(self, n):
+        self.sent += n
+        if not self.enabled:
+            return
+        pct = min(100, round(self.sent * 100 / self.total)) if self.total else 100
+        width = 24
+        filled = round(width * pct / 100)
+        bar = "█" * filled + "░" * (width - filled)
+        line = f"  {fmt_bytes(self.sent)} / {fmt_bytes(self.total)} [{bar}] {pct}%"
+        if line != self._last:
+            sys.stderr.write("\r\x1b[2K" + line)
+            sys.stderr.flush()
+            self._last = line
+
+    def done(self):
+        if self.enabled and self._last:
+            sys.stderr.write("\r\x1b[2K")
+            sys.stderr.flush()
+
+
+class _ProgressReader:
+    """File-like body wrapper: http.client reads it in blocks, which is what
+    lets us count the bytes as they go out."""
+
+    def __init__(self, data, progress):
+        self._buf = io.BytesIO(data)
+        self._progress = progress
+
+    def read(self, n=-1):
+        chunk = self._buf.read(n)
+        if chunk:
+            self._progress.update(len(chunk))
+        return chunk
+
+
+def upload(url, payload, content_type):
+    """POST `payload` to `url` with upload progress. Returns (status, body)
+    where body is parsed JSON or None."""
+    progress = _Progress(len(payload))
+    req = urllib.request.Request(
+        url,
+        data=_ProgressReader(payload, progress),
+        headers={
+            "Content-Type": content_type,
+            "Content-Length": str(len(payload)),
+            # The default Python-urllib user agent is rejected at the edge (403).
+            "User-Agent": f"harvis/{__version__}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as res:
+            status = res.status
+            raw = res.read()
+    except urllib.error.HTTPError as err:
+        status = err.code
+        raw = err.read()
+    except (urllib.error.URLError, OSError) as err:
+        progress.done()
+        reason = getattr(err, "reason", err)
+        print(f"Upload failed: {reason}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        progress.done()
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    return status, body
 
 
 def open_in_browser(url):
@@ -219,35 +365,6 @@ def ensure_gitignored(directory):
         pass
 
 
-def post_json(url, payload):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            # The default Python-urllib user agent is rejected at the edge (403).
-            "User-Agent": f"harvis/{__version__}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req) as res:
-            status = res.status
-            raw = res.read()
-    except urllib.error.HTTPError as err:
-        status = err.code
-        raw = err.read()
-    except (urllib.error.URLError, OSError) as err:
-        reason = getattr(err, "reason", err)
-        print(f"Upload failed: {reason}", file=sys.stderr)
-        sys.exit(1)
-    try:
-        body = json.loads(raw)
-    except ValueError:
-        body = None
-    return status, body
-
-
 def deploy(args):
     if not os.path.isdir(args.dir):
         print(f"Not a directory: {args.dir}", file=sys.stderr)
@@ -267,18 +384,38 @@ def deploy(args):
         if state and state.get("subdomain") and deploy_token:
             linked = {"subdomain": state["subdomain"], "deployToken": deploy_token}
 
+    use_zip = should_zip(files, total_bytes)
+    zip_payload = build_zip(files) if use_zip else None
+    size_note = (
+        f"{fmt_bytes(total_bytes)} → {fmt_bytes(len(zip_payload))} zipped"
+        if use_zip
+        else fmt_bytes(total_bytes)
+    )
     action = f"Updating {linked['subdomain']}" if linked else "Uploading"
     plural = "" if len(files) == 1 else "s"
-    print(f"{action}: {len(files)} file{plural} ({total_bytes / 1024:.1f} KB)...")
+    print(f"{action}: {len(files)} file{plural} ({size_note})...")
 
     def post_deploy(target):
-        payload = {"files": files}
+        url = API_URL
+        if use_zip:
+            # Raw zip body; metadata travels in query params.
+            params = {}
+            if args.name:
+                params["name"] = args.name
+            if target:
+                params["subdomain"] = target["subdomain"]
+                params["deployToken"] = target["deployToken"]
+            if params:
+                url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+            return upload(url, zip_payload, "application/zip")
+        fields = {}
         if args.name:
-            payload["name"] = args.name
+            fields["name"] = args.name
         if target:
-            payload["subdomain"] = target["subdomain"]
-            payload["deployToken"] = target["deployToken"]
-        return post_json(API_URL, payload)
+            fields["subdomain"] = target["subdomain"]
+            fields["deployToken"] = target["deployToken"]
+        payload, content_type = build_multipart(files, fields)
+        return upload(url, payload, content_type)
 
     status, body = post_deploy(linked)
 

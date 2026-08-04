@@ -3,8 +3,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+const https = require("https");
 const { spawn } = require("child_process");
+const { zipSync } = require("fflate");
 
+const VERSION = require("../package.json").version;
 const API_URL = process.env.HARVIS_API_URL || "https://harvis.dev/api/upload";
 const MAX_FILES = 500;
 const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
@@ -13,7 +17,9 @@ const STATE_FILE = ".harvis.json";
 const IGNORED_DIRS = new Set(["node_modules", "__MACOSX"]);
 const IGNORED_FILES = new Set(["Thumbs.db", "desktop.ini", STATE_FILE]);
 
-const TEXT_EXTENSIONS = new Set([
+// Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
+// already compressed, so zipping them gains nothing.
+const COMPRESSIBLE_EXTENSIONS = new Set([
   ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
   ".json", ".map", ".txt", ".md", ".markdown", ".svg", ".xml", ".rss",
   ".atom", ".yml", ".yaml", ".csv", ".tsv", ".webmanifest", ".ini", ".toml",
@@ -91,6 +97,12 @@ function parseArgs(argv) {
   return args;
 }
 
+function isCompressible(name) {
+  const ext = path.extname(name).toLowerCase();
+  // Extensionless files (LICENSE, CNAME…) are almost always text.
+  return ext === "" || COMPRESSIBLE_EXTENSIONS.has(ext);
+}
+
 function collectFiles(rootDir) {
   const files = [];
   let totalBytes = 0;
@@ -116,12 +128,7 @@ function collectFiles(rootDir) {
         const buf = fs.readFileSync(abs);
         totalBytes += buf.length;
         const relPath = path.relative(rootDir, abs).split(path.sep).join("/");
-        const isText = TEXT_EXTENSIONS.has(path.extname(entry.name).toLowerCase());
-        files.push({
-          path: relPath,
-          content: isText ? buf.toString("utf8") : buf.toString("base64"),
-          encoding: isText ? "text" : "base64",
-        });
+        files.push({ path: relPath, data: buf, compressible: isCompressible(entry.name) });
         if (files.length > MAX_FILES) {
           console.error(`Too many files: the limit is ${MAX_FILES} per site.`);
           process.exit(1);
@@ -136,6 +143,125 @@ function collectFiles(rootDir) {
 
   walk(rootDir);
   return { files, totalBytes };
+}
+
+// Zip when deflating pays for itself: text shrinks ~60-70%, while already-
+// compressed media gains nothing, so a folder that is (almost) all media
+// uploads as raw multipart instead. A lone .zip file is always wrapped —
+// sent bare, the server would extract the file itself.
+function shouldZip(files, totalBytes) {
+  if (files.length === 1 && /\.zip$/i.test(files[0].path)) return true;
+  const compressibleBytes = files.reduce(
+    (sum, f) => sum + (f.compressible ? f.data.length : 0), 0,
+  );
+  return compressibleBytes >= totalBytes * 0.1;
+}
+
+function buildZip(files) {
+  const entries = {};
+  for (const f of files) {
+    entries[f.path] = [f.data, { level: f.compressible ? 6 : 0 }];
+  }
+  return Buffer.from(zipSync(entries));
+}
+
+function buildMultipart(files, fields) {
+  const boundary = "----harvis" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const parts = [];
+  const push = (s) => parts.push(Buffer.from(s, "utf8"));
+  for (const [key, value] of Object.entries(fields)) {
+    if (!value) continue;
+    push(`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`);
+  }
+  for (const f of files) {
+    // The paired "paths" field is the source of truth for the relative path;
+    // the filename only needs to be a safe label.
+    const label = f.path.split("/").pop().replace(/["\r\n]/g, "_");
+    push(`--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="${label}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+    parts.push(f.data);
+    push(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="paths"\r\n\r\n${f.path}\r\n`);
+  }
+  push(`--${boundary}--\r\n`);
+  return { payload: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function fmtBytes(n) {
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Renders on stderr only when it is an interactive terminal, so pipes and
+// CI logs stay clean.
+function makeProgress(total) {
+  if (!process.stderr.isTTY) return { update() {}, done() {} };
+  let last = "";
+  return {
+    update(sent) {
+      const pct = total ? Math.min(100, Math.round((sent / total) * 100)) : 100;
+      const width = 24;
+      const filled = Math.round((width * pct) / 100);
+      const line = `  ${fmtBytes(sent)} / ${fmtBytes(total)} [${"█".repeat(filled)}${"░".repeat(width - filled)}] ${pct}%`;
+      if (line !== last) {
+        process.stderr.write("\r\x1b[2K" + line);
+        last = line;
+      }
+    },
+    done() {
+      if (last) process.stderr.write("\r\x1b[2K");
+    },
+  };
+}
+
+// POST `payload` to `url`, writing in chunks so upload progress can be
+// reported. Resolves with { status, body } where body is parsed JSON or null.
+function upload(url, payload, contentType) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const lib = target.protocol === "http:" ? http : https;
+    const progress = makeProgress(payload.length);
+    const req = lib.request(target, {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": payload.length,
+        "User-Agent": `harvis/${VERSION}`,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        progress.done();
+        let body = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch {
+          // fall through to the status check at the call site
+        }
+        resolve({ status: res.statusCode, body });
+      });
+    });
+    req.on("error", (err) => {
+      progress.done();
+      reject(err);
+    });
+
+    const CHUNK = 64 * 1024;
+    let offset = 0;
+    function writeMore() {
+      while (offset < payload.length) {
+        const chunk = payload.subarray(offset, offset + CHUNK);
+        offset += chunk.length;
+        const ok = req.write(chunk);
+        progress.update(offset);
+        if (!ok) {
+          req.once("drain", writeMore);
+          return;
+        }
+      }
+      req.end();
+    }
+    writeMore();
+  });
 }
 
 function openInBrowser(url) {
@@ -216,51 +342,61 @@ async function deploy(args) {
     }
   }
 
+  const useZip = shouldZip(files, totalBytes);
+  const zipPayload = useZip ? buildZip(files) : null;
+  const sizeNote = useZip
+    ? `${fmtBytes(totalBytes)} → ${fmtBytes(zipPayload.length)} zipped`
+    : fmtBytes(totalBytes);
   const action = linked ? `Updating ${linked.subdomain}` : "Uploading";
-  console.log(`${action}: ${files.length} file${files.length === 1 ? "" : "s"} (${(totalBytes / 1024).toFixed(1)} KB)...`);
+  console.log(`${action}: ${files.length} file${files.length === 1 ? "" : "s"} (${sizeNote})...`);
 
   async function postDeploy(target) {
-    const payload = { files };
-    if (args.name) payload.name = args.name;
-    if (target) {
-      payload.subdomain = target.subdomain;
-      payload.deployToken = target.deployToken;
+    let url = API_URL;
+    let payload, contentType;
+    if (useZip) {
+      // Raw zip body; metadata travels in query params.
+      const q = new URLSearchParams();
+      if (args.name) q.set("name", args.name);
+      if (target) {
+        q.set("subdomain", target.subdomain);
+        q.set("deployToken", target.deployToken);
+      }
+      const qs = q.toString();
+      if (qs) url += (url.includes("?") ? "&" : "?") + qs;
+      payload = zipPayload;
+      contentType = "application/zip";
+    } else {
+      const fields = {};
+      if (args.name) fields.name = args.name;
+      if (target) {
+        fields.subdomain = target.subdomain;
+        fields.deployToken = target.deployToken;
+      }
+      ({ payload, contentType } = buildMultipart(files, fields));
     }
-    let res;
     try {
-      res = await fetch(API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      return await upload(url, payload, contentType);
     } catch (err) {
       console.error(`Upload failed: ${err.message}`);
       process.exit(1);
     }
-    let body = null;
-    try {
-      body = await res.json();
-    } catch {
-      // fall through to the status check below
-    }
-    return { res, body };
   }
 
-  let { res, body } = await postDeploy(linked);
+  let { status, body } = await postDeploy(linked);
 
-  if (linked && res.status === 404) {
+  if (linked && status === 404) {
     console.log(`Site ${linked.subdomain} no longer exists (unclaimed sites expire after 24 hours). Creating a new site...`);
     linked = null;
-    ({ res, body } = await postDeploy(null));
-  } else if (linked && res.status === 403) {
+    ({ status, body } = await postDeploy(null));
+  } else if (linked && status === 403) {
     console.error(`Deploy failed: the deploy token doesn't match site ${linked.subdomain}.`);
     console.error("Get the current token from the dashboard and run `harvis link " + linked.subdomain + " --token <token>`,");
     console.error("or run `harvis --new` to create a fresh site.");
     process.exit(1);
   }
 
-  if (!res.ok || !body || !body.url) {
-    const message = (body && body.error) || `HTTP ${res.status}`;
+  if (status >= 400 || !body || !body.url) {
+    const message = (body && body.error) || `HTTP ${status}`;
     console.error(`Deploy failed: ${message}`);
     process.exit(1);
   }
@@ -317,7 +453,7 @@ async function main() {
 
   if (args.command === "help") return printHelp();
   if (args.command === "version") {
-    return console.log(require("../package.json").version);
+    return console.log(VERSION);
   }
   if (args.command === "claim") {
     const state = readState(process.cwd());

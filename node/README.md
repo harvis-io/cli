@@ -60,6 +60,7 @@ To start over with a fresh URL, run `harvis --new`.
 
 ## Notes
 
+- Uploads are zipped when the folder compresses well (HTML/CSS/JS shrink ~60-70%); folders that are mostly already-compressed media (images, video, fonts) upload as raw multipart instead. A progress bar is shown on interactive terminals.
 - Limits: 500 files, 50 MB per site. Hidden files and folders (anything starting with `.`, like `.env` or `.git`), `node_modules`, and OS junk files are skipped automatically.
 - **Unclaimed sites expire 24 hours after the last deploy.** Claim a site to keep it online permanently. If a linked site has expired, the next deploy tells you and creates a new one.
 - `.harvis.json` contains the deploy token and claim link — keep it private. The CLI adds it to `.gitignore` automatically when one exists.
