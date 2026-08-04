@@ -21,7 +21,7 @@ Output:
 ```
 Uploading 3 files (12.4 KB)...
 
-  Live site:   https://harvis.dev/s/happy-panda-482
+  Live site:   https://happy-panda-482.harvis.dev/
   Claim link:  https://harvis.dev/claim/xxxxxxxx-...
 
 The claim link is private and single-use: open it and sign in to
