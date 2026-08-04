@@ -1,0 +1,29 @@
+{
+  "name": "harvis",
+  "version": "0.0.1",
+  "description": "Deploy the current folder to harvis.dev with one command.",
+  "bin": {
+    "harvis": "bin/harvis.js"
+  },
+  "files": [
+    "bin/harvis.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "harvis",
+    "hosting",
+    "free-hosting",
+    "static-hosting",
+    "deploy",
+    "static-site",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harvis-io/cli.git"
+  },
+  "homepage": "https://harvis.dev",
+  "license": "MIT"
+}

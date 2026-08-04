@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Syntax check
+        run: node --check bin/harvis.js
+      - name: Smoke test --help
+        run: node bin/harvis.js --help
+      - name: Smoke test --version
+        run: node bin/harvis.js --version
+      - name: Pack
+        run: npm pack --dry-run
