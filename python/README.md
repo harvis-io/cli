@@ -34,26 +34,42 @@ manage the site. Run `harvis claim` to open it in your browser.
 | --- | --- |
 | `harvis` | Deploy the current folder (updates the linked site, or creates one) |
 | `harvis deploy [dir]` | Deploy a specific folder |
-| `harvis link <subdomain>` | Link the current folder to an existing site |
+| `harvis link <subdomain>` | Link this project to an existing site |
 | `harvis claim` | Open the last deploy's claim link in your browser |
 | `harvis open` | Open the last deploy's live site in your browser |
 
 ## Options
 
 - `--name <name>` — set the site name (defaults to the page `<title>`)
-- `--new` — create a fresh site even if the folder is already linked to one
-- `--token <token>` — deploy token for `harvis link` (or set `HARVIS_DEPLOY_TOKEN`)
+- `--new` — create a fresh site even if this project is already linked to one
+- `--token <token>` — deploy token (or set `HARVIS_DEPLOY_TOKEN`)
+- `--subdomain <sub>` — deploy to this site (or set `HARVIS_SUBDOMAIN`)
 - `--claim` — open the claim link in your browser right after deploying
 
 ## Updating a site
 
-The first deploy creates a site and saves its **deploy token** to `.harvis.json`. Every later deploy from the same folder sends that token and updates the same site — before *and* after you claim it. Claiming attaches the site to your account; the token keeps working, and you can view or regenerate it in the dashboard.
+The first deploy creates a site and records it in two places:
 
-To deploy an existing site from another machine or CI, link the folder first:
+- **`harvis.json`** at your project root — the site name only, no secrets. Commit it, and every clone of the project deploys to the same site.
+- **`~/.config/harvis/credentials.json`** — the **deploy token**, stored per user with `0600` permissions. Because it lives outside the project, rebuilding or deleting your output folder never loses it. (`%APPDATA%\harvis\credentials.json` on Windows; honours `XDG_CONFIG_HOME`, or `HARVIS_CONFIG_DIR` to override.)
+
+Every later deploy from the same project sends that token and updates the same site — before *and* after you claim it. Claiming attaches the site to your account; the token keeps working, and you can view or regenerate it in the dashboard.
+
+The project root is found by walking up from the folder being deployed, looking for `harvis.json`, `.git`, `package.json`, `pyproject.toml` and friends — so `harvis deploy dist` links the project, not the build output.
+
+To deploy an existing site from another machine, link the project once:
 
 ```bash
 harvis link happy-panda-482 --token <token-from-dashboard>
 harvis
+```
+
+In CI, set the environment instead of running `link`:
+
+```bash
+export HARVIS_DEPLOY_TOKEN=<token-from-dashboard>
+export HARVIS_SUBDOMAIN=happy-panda-482   # optional if harvis.json is committed
+harvis deploy dist
 ```
 
 To start over with a fresh URL, run `harvis --new`.
@@ -63,7 +79,7 @@ To start over with a fresh URL, run `harvis --new`.
 - Uploads are zipped when the folder compresses well (HTML/CSS/JS shrink ~60-70%); folders that are mostly already-compressed media (images, video, fonts) upload as raw multipart instead. A progress bar is shown on interactive terminals.
 - Limits: 500 files, 50 MB per site. Hidden files and folders (anything starting with `.`, like `.env` or `.git`), `node_modules`, and OS junk files are skipped automatically.
 - **Unclaimed sites expire 24 hours after the last deploy.** Claim a site to keep it online permanently. If a linked site has expired, the next deploy tells you and creates a new one.
-- `.harvis.json` contains the deploy token and claim link — keep it private. The CLI adds it to `.gitignore` automatically when one exists.
+- The deploy token is a secret and stays out of your project: it is written only to `~/.config/harvis/credentials.json`, mode `0600`. The `harvis.json` file in your project holds nothing but the site name and is safe to commit.
 - The claim link is single-use and can't be recovered. If you want to keep the site, claim it before it expires.
 
 ## Development

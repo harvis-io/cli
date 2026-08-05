@@ -2,6 +2,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
@@ -12,10 +13,22 @@ const VERSION = require("../package.json").version;
 const API_URL = process.env.HARVIS_API_URL || "https://harvis.dev/api/upload";
 const MAX_FILES = 500;
 const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
-const STATE_FILE = ".harvis.json";
+
+// Deploy tokens live in a per-user store outside the project, so a rebuild
+// that wipes the output folder cannot lose them. Only the (non-secret) site
+// name is kept in the project, in a file that is safe to commit.
+const CREDENTIALS_FILE = "credentials.json";
+const LINK_FILE = "harvis.json";
+
+// Anything that marks the top of a project. The link file is included so a
+// second deploy finds the link even in a folder with no other marker.
+const PROJECT_MARKERS = [
+  LINK_FILE, ".git", "package.json", "pyproject.toml", "deno.json",
+  "deno.jsonc", "go.mod", "Cargo.toml", "Gemfile", "composer.json",
+];
 
 const IGNORED_DIRS = new Set(["node_modules", "__MACOSX"]);
-const IGNORED_FILES = new Set(["Thumbs.db", "desktop.ini", STATE_FILE]);
+const IGNORED_FILES = new Set(["Thumbs.db", "desktop.ini", LINK_FILE, ".harvis.json"]);
 
 // Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
 // already compressed, so zipping them gains nothing.
@@ -30,34 +43,37 @@ function printHelp() {
 
 Usage:
   harvis                     Deploy the current folder (updates the linked
-                             site if ${STATE_FILE} exists, else creates one)
+                             site if this project has one, else creates one)
   harvis deploy [dir]        Deploy a folder (default: current folder)
-  harvis link <subdomain>    Link this folder to an existing site
+  harvis link <subdomain>    Link this project to an existing site
   harvis claim               Open the claim link of the last deploy
   harvis open                Open the live site of the last deploy
 
 Options:
-  --name <name>    Set the site name (default: taken from the page <title>)
-  --new            Create a fresh site even if this folder is already linked
-  --token <token>  Deploy token (for harvis link; or set HARVIS_DEPLOY_TOKEN)
-  --claim          After deploying, open the claim link in your browser
-  -h, --help       Show this help
-  -v, --version    Show version
+  --name <name>       Set the site name (default: from the page <title>)
+  --new               Create a fresh site even if this project is linked
+  --token <token>     Deploy token (or set HARVIS_DEPLOY_TOKEN)
+  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN)
+  --claim             After deploying, open the claim link in your browser
+  -h, --help          Show this help
+  -v, --version       Show version
 
 The first deploy prints two links:
   Live site   — public URL of your site
   Claim link  — private, single-use; open it and sign in to manage the site
 
-Later deploys from the same folder update the same site using the deploy
-token saved in ${STATE_FILE}. The token stays valid after you claim the
-site, and you can view or regenerate it in the dashboard — use it with
-\`harvis link\` to deploy from another machine or CI.
+Later deploys from the same project update the same site. The site name is
+recorded in ${LINK_FILE} at the project root (no secrets — safe to commit),
+and the deploy token is stored per user in
+  ${credentialsPath()}
+so rebuilding or deleting the output folder never loses it.
+
+The token stays valid after you claim the site, and you can view or
+regenerate it in the dashboard — use it with \`harvis link\`, or set
+HARVIS_SUBDOMAIN and HARVIS_DEPLOY_TOKEN, to deploy from CI.
 
 Unclaimed sites expire 24 hours after the last deploy. Claim a site to
-keep it online.
-
-${STATE_FILE} contains the deploy token — keep it out of version control
-(it is added to .gitignore automatically when one exists).`);
+keep it online.`);
 }
 
 function parseArgs(argv) {
@@ -76,6 +92,8 @@ function parseArgs(argv) {
     else if (a.startsWith("--name=")) args.name = a.slice("--name=".length);
     else if (a === "--token") args.token = argv[++i] || null;
     else if (a.startsWith("--token=")) args.token = a.slice("--token=".length);
+    else if (a === "--subdomain") args.subdomain = argv[++i] || null;
+    else if (a.startsWith("--subdomain=")) args.subdomain = a.slice("--subdomain=".length);
     else if (a.startsWith("-")) {
       console.error(`Unknown option: ${a} (see: harvis --help)`);
       process.exit(1);
@@ -89,7 +107,7 @@ function parseArgs(argv) {
       args.command = first;
     } else if (first === "link") {
       args.command = "link";
-      args.subdomain = rest[1] || null;
+      if (rest[1]) args.subdomain = rest[1];
     } else {
       args.dir = path.resolve(first);
     }
@@ -274,48 +292,134 @@ function openInBrowser(url) {
   child.unref();
 }
 
-function readState(dir) {
-  const file = path.join(dir, STATE_FILE);
-  if (!fs.existsSync(file)) {
-    console.error(`No ${STATE_FILE} found in this folder. Deploy first with: harvis`);
-    process.exit(1);
+function configDir() {
+  if (process.env.HARVIS_CONFIG_DIR) return path.resolve(process.env.HARVIS_CONFIG_DIR);
+  if (process.platform === "win32" && process.env.APPDATA) {
+    return path.join(process.env.APPDATA, "harvis");
   }
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(base, "harvis");
+}
+
+function credentialsPath() {
+  return path.join(configDir(), CREDENTIALS_FILE);
+}
+
+// { sites: { <subdomain>: { url, name, deployToken, claimUrl, deployedAt } },
+//   projects: { <projectRoot>: <subdomain> } }
+function readCredentials() {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    const raw = JSON.parse(fs.readFileSync(credentialsPath(), "utf8"));
+    return { sites: raw.sites || {}, projects: raw.projects || {} };
   } catch {
-    console.error(`${STATE_FILE} is not valid JSON. Deploy again with: harvis`);
-    process.exit(1);
+    // Missing or corrupt: start fresh rather than blocking the deploy.
+    return { sites: {}, projects: {} };
   }
 }
 
-function tryReadState(dir) {
+function writeCredentials(creds) {
+  const file = credentialsPath();
   try {
-    return JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), "utf8"));
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    // Write-then-rename so an interrupted write cannot truncate the store,
+    // and 0600 because deploy tokens are secrets.
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(creds, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    fs.chmodSync(file, 0o600);
+  } catch (err) {
+    console.error(`Warning: could not save the deploy token to ${file}: ${err.message}`);
+  }
+}
+
+// The project root is where the link file goes: walking up from the deployed
+// folder means `harvis deploy dist` links the project, not the build output.
+function findProjectRoot(startDir) {
+  const home = os.homedir();
+  let dir = startDir;
+  for (;;) {
+    if (PROJECT_MARKERS.some((m) => fs.existsSync(path.join(dir, m)))) return dir;
+    const parent = path.dirname(dir);
+    // Never walk past $HOME — a dotfiles repo there would swallow every project.
+    if (parent === dir || dir === home) return startDir;
+    dir = parent;
+  }
+}
+
+function readLinkFile(root) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(root, LINK_FILE), "utf8"));
+    return raw && typeof raw.subdomain === "string" ? raw : null;
   } catch {
     return null;
   }
 }
 
-function writeState(dir, state) {
+function writeLinkFile(root, subdomain) {
+  const existing = readLinkFile(root);
+  if (existing && existing.subdomain === subdomain) return;
   try {
-    fs.writeFileSync(path.join(dir, STATE_FILE), JSON.stringify(state, null, 2) + "\n");
+    fs.writeFileSync(path.join(root, LINK_FILE), JSON.stringify({ subdomain }, null, 2) + "\n");
+    if (!existing) {
+      console.log(`Wrote ${path.join(root, LINK_FILE)} (site name only — safe to commit).`);
+    }
   } catch {
-    // Saving state is best-effort; the links are printed either way.
+    // Best-effort: the credential store already remembers this project.
   }
 }
 
-function ensureGitignored(dir) {
-  const file = path.join(dir, ".gitignore");
-  if (!fs.existsSync(file)) return;
-  try {
-    const content = fs.readFileSync(file, "utf8");
-    if (content.split(/\r?\n/).some((line) => line.trim() === STATE_FILE)) return;
-    const sep = content === "" || content.endsWith("\n") ? "" : "\n";
-    fs.appendFileSync(file, `${sep}${STATE_FILE}\n`);
-    console.log(`Added ${STATE_FILE} to .gitignore (it contains your deploy token).`);
-  } catch {
-    // Best-effort; the help text still warns about committing the state file.
+// Where a deploy goes, in order: flags, env (CI), the committed link file,
+// then the per-user store keyed by project root.
+function resolveLink(startDir, args) {
+  const root = findProjectRoot(startDir);
+  const creds = readCredentials();
+  const link = readLinkFile(root);
+  const subdomain = (args && args.subdomain) || process.env.HARVIS_SUBDOMAIN
+    || (link && link.subdomain) || creds.projects[root] || null;
+  if (!subdomain) return { root, subdomain: null, site: null, target: null };
+  const site = creds.sites[subdomain] || null;
+  const deployToken = (args && args.token) || process.env.HARVIS_DEPLOY_TOKEN
+    || (site && site.deployToken) || null;
+  return {
+    root,
+    subdomain,
+    site,
+    target: deployToken ? { subdomain, deployToken } : null,
+  };
+}
+
+function rememberSite(root, subdomain, body) {
+  const creds = readCredentials();
+  const previous = creds.projects[root];
+  // A project points at one site; drop the record it replaced.
+  if (previous && previous !== subdomain) delete creds.sites[previous];
+  const prior = creds.sites[subdomain] || {};
+  const record = {
+    url: body.url,
+    name: body.name || prior.name,
+    // The server only returns the token on create; keep the stored one otherwise.
+    deployToken: body.deployToken || prior.deployToken,
+    deployedAt: new Date().toISOString(),
+  };
+  // Absent on a claimed site — dropping it keeps `harvis claim` honest.
+  if (body.claimUrl) record.claimUrl = body.claimUrl;
+  creds.sites[subdomain] = record;
+  creds.projects[root] = subdomain;
+  writeCredentials(creds);
+}
+
+function requireSite(startDir) {
+  const { subdomain, site } = resolveLink(startDir, null);
+  if (!subdomain) {
+    console.error("This project is not linked to a site yet. Deploy first with: harvis");
+    process.exit(1);
   }
+  if (!site || !site.url) {
+    console.error(`No local record of ${subdomain} in ${credentialsPath()}.`);
+    console.error("Deploy again with `harvis`, or run `harvis link " + subdomain + " --token <token>`.");
+    process.exit(1);
+  }
+  return site;
 }
 
 async function deploy(args) {
@@ -333,13 +437,11 @@ async function deploy(args) {
     console.error("Warning: no .html file found — the site may not have a homepage.");
   }
 
-  let linked = null;
-  if (!args.forceNew) {
-    const state = tryReadState(args.dir);
-    const deployToken = process.env.HARVIS_DEPLOY_TOKEN || (state && state.deployToken);
-    if (state && state.subdomain && deployToken) {
-      linked = { subdomain: state.subdomain, deployToken };
-    }
+  const resolved = resolveLink(args.dir, args);
+  let linked = args.forceNew ? null : resolved.target;
+  if (!args.forceNew && resolved.subdomain && !linked) {
+    console.error(`No deploy token for ${resolved.subdomain} in ${credentialsPath()} — creating a new site.`);
+    console.error(`Run \`harvis link ${resolved.subdomain} --token <token>\` to update it instead.`);
   }
 
   const useZip = shouldZip(files, totalBytes);
@@ -401,16 +503,11 @@ async function deploy(args) {
     process.exit(1);
   }
 
-  const state = {
-    url: body.url,
-    subdomain: body.subdomain,
-    name: body.name,
-    deployToken: body.deployToken,
-    deployedAt: new Date().toISOString(),
-  };
-  if (body.claimUrl) state.claimUrl = body.claimUrl;
-  writeState(args.dir, state);
-  ensureGitignored(args.dir);
+  const subdomain = body.subdomain || (linked && linked.subdomain);
+  if (subdomain) {
+    rememberSite(resolved.root, subdomain, body);
+    writeLinkFile(resolved.root, subdomain);
+  }
 
   console.log("");
   if (linked) {
@@ -426,7 +523,7 @@ async function deploy(args) {
     console.log("");
     console.log("The claim link is private and single-use: open it and sign in to");
     console.log("manage the site. Run `harvis claim` to open it in your browser.");
-    console.log("Unclaimed sites expire after 24 hours. Deploying this folder again");
+    console.log("Unclaimed sites expire after 24 hours. Deploying this project again");
     console.log("updates this same site.");
   }
 
@@ -440,12 +537,15 @@ function link(args) {
     console.error("Find the site's deploy token in the harvis.dev dashboard.");
     process.exit(1);
   }
-  const state = tryReadState(process.cwd()) || {};
-  state.subdomain = args.subdomain;
-  state.deployToken = deployToken;
-  writeState(process.cwd(), state);
-  ensureGitignored(process.cwd());
-  console.log(`Linked this folder to ${args.subdomain}. Run \`harvis\` to deploy.`);
+  const root = findProjectRoot(process.cwd());
+  const creds = readCredentials();
+  const previous = creds.projects[root];
+  if (previous && previous !== args.subdomain) delete creds.sites[previous];
+  creds.sites[args.subdomain] = { ...(creds.sites[args.subdomain] || {}), deployToken };
+  creds.projects[root] = args.subdomain;
+  writeCredentials(creds);
+  writeLinkFile(root, args.subdomain);
+  console.log(`Linked ${root} to ${args.subdomain}. Run \`harvis\` to deploy.`);
 }
 
 async function main() {
@@ -456,18 +556,18 @@ async function main() {
     return console.log(VERSION);
   }
   if (args.command === "claim") {
-    const state = readState(process.cwd());
-    if (!state.claimUrl) {
-      console.error(`No claim link in ${STATE_FILE}.`);
+    const site = requireSite(process.cwd());
+    if (!site.claimUrl) {
+      console.error("No claim link for this site — it is already claimed, or was claimed elsewhere.");
       process.exit(1);
     }
-    console.log(`Opening claim link: ${state.claimUrl}`);
-    return openInBrowser(state.claimUrl);
+    console.log(`Opening claim link: ${site.claimUrl}`);
+    return openInBrowser(site.claimUrl);
   }
   if (args.command === "open") {
-    const state = readState(process.cwd());
-    console.log(`Opening live site: ${state.url}`);
-    return openInBrowser(state.url);
+    const site = requireSite(process.cwd());
+    console.log(`Opening live site: ${site.url}`);
+    return openInBrowser(site.url);
   }
   if (args.command === "link") return link(args);
   return deploy(args);

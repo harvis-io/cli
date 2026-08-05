@@ -18,10 +18,22 @@ from harvis import __version__
 API_URL = os.environ.get("HARVIS_API_URL", "https://harvis.dev/api/upload")
 MAX_FILES = 500
 MAX_PROJECT_BYTES = 50 * 1024 * 1024
-STATE_FILE = ".harvis.json"
+
+# Deploy tokens live in a per-user store outside the project, so a rebuild
+# that wipes the output folder cannot lose them. Only the (non-secret) site
+# name is kept in the project, in a file that is safe to commit.
+CREDENTIALS_FILE = "credentials.json"
+LINK_FILE = "harvis.json"
+
+# Anything that marks the top of a project. The link file is included so a
+# second deploy finds the link even in a folder with no other marker.
+PROJECT_MARKERS = (
+    LINK_FILE, ".git", "package.json", "pyproject.toml", "deno.json",
+    "deno.jsonc", "go.mod", "Cargo.toml", "Gemfile", "composer.json",
+)
 
 IGNORED_DIRS = {"node_modules", "__MACOSX"}
-IGNORED_FILES = {"Thumbs.db", "desktop.ini", STATE_FILE}
+IGNORED_FILES = {"Thumbs.db", "desktop.ini", LINK_FILE, ".harvis.json"}
 
 # Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
 # already compressed, so zipping them gains nothing.
@@ -37,34 +49,37 @@ def print_help():
 
 Usage:
   harvis                     Deploy the current folder (updates the linked
-                             site if {STATE_FILE} exists, else creates one)
+                             site if this project has one, else creates one)
   harvis deploy [dir]        Deploy a folder (default: current folder)
-  harvis link <subdomain>    Link this folder to an existing site
+  harvis link <subdomain>    Link this project to an existing site
   harvis claim               Open the claim link of the last deploy
   harvis open                Open the live site of the last deploy
 
 Options:
-  --name <name>    Set the site name (default: taken from the page <title>)
-  --new            Create a fresh site even if this folder is already linked
-  --token <token>  Deploy token (for harvis link; or set HARVIS_DEPLOY_TOKEN)
-  --claim          After deploying, open the claim link in your browser
-  -h, --help       Show this help
-  -v, --version    Show version
+  --name <name>       Set the site name (default: from the page <title>)
+  --new               Create a fresh site even if this project is linked
+  --token <token>     Deploy token (or set HARVIS_DEPLOY_TOKEN)
+  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN)
+  --claim             After deploying, open the claim link in your browser
+  -h, --help          Show this help
+  -v, --version       Show version
 
 The first deploy prints two links:
   Live site   — public URL of your site
   Claim link  — private, single-use; open it and sign in to manage the site
 
-Later deploys from the same folder update the same site using the deploy
-token saved in {STATE_FILE}. The token stays valid after you claim the
-site, and you can view or regenerate it in the dashboard — use it with
-`harvis link` to deploy from another machine or CI.
+Later deploys from the same project update the same site. The site name is
+recorded in {LINK_FILE} at the project root (no secrets — safe to commit),
+and the deploy token is stored per user in
+  {credentials_path()}
+so rebuilding or deleting the output folder never loses it.
+
+The token stays valid after you claim the site, and you can view or
+regenerate it in the dashboard — use it with `harvis link`, or set
+HARVIS_SUBDOMAIN and HARVIS_DEPLOY_TOKEN, to deploy from CI.
 
 Unclaimed sites expire 24 hours after the last deploy. Claim a site to
-keep it online.
-
-{STATE_FILE} contains the deploy token — keep it out of version control
-(it is added to .gitignore automatically when one exists).""")
+keep it online.""")
 
 
 class Args:
@@ -102,6 +117,11 @@ def parse_args(argv):
             args.token = argv[i] if i < len(argv) else None
         elif a.startswith("--token="):
             args.token = a[len("--token="):]
+        elif a == "--subdomain":
+            i += 1
+            args.subdomain = argv[i] if i < len(argv) else None
+        elif a.startswith("--subdomain="):
+            args.subdomain = a[len("--subdomain="):]
         elif a.startswith("-"):
             print(f"Unknown option: {a} (see: harvis --help)", file=sys.stderr)
             sys.exit(1)
@@ -117,7 +137,8 @@ def parse_args(argv):
             args.command = first
         elif first == "link":
             args.command = "link"
-            args.subdomain = rest[1] if len(rest) > 1 else None
+            if len(rest) > 1:
+                args.subdomain = rest[1]
         else:
             args.dir = os.path.abspath(first)
     return args
@@ -317,52 +338,146 @@ def open_in_browser(url):
         print(f"Could not open a browser. Open this URL yourself:\n  {url}", file=sys.stderr)
 
 
-def read_state(directory):
-    file = os.path.join(directory, STATE_FILE)
-    if not os.path.exists(file):
-        print(f"No {STATE_FILE} found in this folder. Deploy first with: harvis", file=sys.stderr)
-        sys.exit(1)
+def config_dir():
+    override = os.environ.get("HARVIS_CONFIG_DIR")
+    if override:
+        return os.path.abspath(override)
+    if sys.platform == "win32" and os.environ.get("APPDATA"):
+        return os.path.join(os.environ["APPDATA"], "harvis")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "harvis")
+
+
+def credentials_path():
+    return os.path.join(config_dir(), CREDENTIALS_FILE)
+
+
+def read_credentials():
+    """{"sites": {<subdomain>: {url, name, deployToken, claimUrl, deployedAt}},
+    "projects": {<projectRoot>: <subdomain>}}"""
     try:
-        with open(file, encoding="utf-8") as f:
-            return json.load(f)
+        with open(credentials_path(), encoding="utf-8") as f:
+            raw = json.load(f)
+        return {"sites": raw.get("sites") or {}, "projects": raw.get("projects") or {}}
     except (OSError, ValueError):
-        print(f"{STATE_FILE} is not valid JSON. Deploy again with: harvis", file=sys.stderr)
-        sys.exit(1)
+        # Missing or corrupt: start fresh rather than blocking the deploy.
+        return {"sites": {}, "projects": {}}
 
 
-def try_read_state(directory):
+def write_credentials(creds):
+    file = credentials_path()
     try:
-        with open(os.path.join(directory, STATE_FILE), encoding="utf-8") as f:
-            return json.load(f)
+        os.makedirs(os.path.dirname(file), mode=0o700, exist_ok=True)
+        # Write-then-rename so an interrupted write cannot truncate the store,
+        # and 0600 because deploy tokens are secrets.
+        tmp = f"{file}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(creds, indent=2) + "\n")
+        os.replace(tmp, file)
+        os.chmod(file, 0o600)
+    except OSError as err:
+        print(f"Warning: could not save the deploy token to {file}: {err}", file=sys.stderr)
+
+
+def find_project_root(start_dir):
+    """The project root is where the link file goes: walking up from the
+    deployed folder means `harvis deploy dist` links the project, not the
+    build output."""
+    home = os.path.expanduser("~")
+    directory = start_dir
+    while True:
+        if any(os.path.exists(os.path.join(directory, m)) for m in PROJECT_MARKERS):
+            return directory
+        parent = os.path.dirname(directory)
+        # Never walk past $HOME — a dotfiles repo there would swallow every project.
+        if parent == directory or directory == home:
+            return start_dir
+        directory = parent
+
+
+def read_link_file(root):
+    try:
+        with open(os.path.join(root, LINK_FILE), encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and isinstance(raw.get("subdomain"), str):
+            return raw
+        return None
     except (OSError, ValueError):
         return None
 
 
-def write_state(directory, state):
-    try:
-        with open(os.path.join(directory, STATE_FILE), "w", encoding="utf-8") as f:
-            f.write(json.dumps(state, indent=2) + "\n")
-    except OSError:
-        # Saving state is best-effort; the links are printed either way.
-        pass
-
-
-def ensure_gitignored(directory):
-    file = os.path.join(directory, ".gitignore")
-    if not os.path.exists(file):
+def write_link_file(root, subdomain):
+    existing = read_link_file(root)
+    if existing and existing.get("subdomain") == subdomain:
         return
     try:
-        with open(file, encoding="utf-8") as f:
-            content = f.read()
-        if any(line.strip() == STATE_FILE for line in content.splitlines()):
-            return
-        sep = "" if content == "" or content.endswith("\n") else "\n"
-        with open(file, "a", encoding="utf-8") as f:
-            f.write(f"{sep}{STATE_FILE}\n")
-        print(f"Added {STATE_FILE} to .gitignore (it contains your deploy token).")
+        with open(os.path.join(root, LINK_FILE), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"subdomain": subdomain}, indent=2) + "\n")
+        if not existing:
+            print(f"Wrote {os.path.join(root, LINK_FILE)} (site name only — safe to commit).")
     except OSError:
-        # Best-effort; the help text still warns about committing the state file.
+        # Best-effort: the credential store already remembers this project.
         pass
+
+
+def resolve_link(start_dir, args=None):
+    """Where a deploy goes, in order: flags, env (CI), the committed link
+    file, then the per-user store keyed by project root."""
+    root = find_project_root(start_dir)
+    creds = read_credentials()
+    link = read_link_file(root)
+    subdomain = (
+        (args.subdomain if args else None)
+        or os.environ.get("HARVIS_SUBDOMAIN")
+        or (link or {}).get("subdomain")
+        or creds["projects"].get(root)
+    )
+    if not subdomain:
+        return {"root": root, "subdomain": None, "site": None, "target": None}
+    site = creds["sites"].get(subdomain)
+    deploy_token = (
+        (args.token if args else None)
+        or os.environ.get("HARVIS_DEPLOY_TOKEN")
+        or (site or {}).get("deployToken")
+    )
+    target = {"subdomain": subdomain, "deployToken": deploy_token} if deploy_token else None
+    return {"root": root, "subdomain": subdomain, "site": site, "target": target}
+
+
+def remember_site(root, subdomain, body):
+    creds = read_credentials()
+    previous = creds["projects"].get(root)
+    # A project points at one site; drop the record it replaced.
+    if previous and previous != subdomain:
+        creds["sites"].pop(previous, None)
+    prior = creds["sites"].get(subdomain) or {}
+    record = {
+        "url": body["url"],
+        "name": body.get("name") or prior.get("name"),
+        # The server only returns the token on create; keep the stored one otherwise.
+        "deployToken": body.get("deployToken") or prior.get("deployToken"),
+        "deployedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    # Absent on a claimed site — dropping it keeps `harvis claim` honest.
+    if body.get("claimUrl"):
+        record["claimUrl"] = body["claimUrl"]
+    creds["sites"][subdomain] = record
+    creds["projects"][root] = subdomain
+    write_credentials(creds)
+
+
+def require_site(start_dir):
+    resolved = resolve_link(start_dir)
+    if not resolved["subdomain"]:
+        print("This project is not linked to a site yet. Deploy first with: harvis", file=sys.stderr)
+        sys.exit(1)
+    site = resolved["site"]
+    if not site or not site.get("url"):
+        print(f"No local record of {resolved['subdomain']} in {credentials_path()}.", file=sys.stderr)
+        print(f"Deploy again with `harvis`, or run `harvis link {resolved['subdomain']} --token <token>`.", file=sys.stderr)
+        sys.exit(1)
+    return site
 
 
 def deploy(args):
@@ -377,12 +492,11 @@ def deploy(args):
     if not any(f["path"].lower().endswith((".html", ".htm")) for f in files):
         print("Warning: no .html file found — the site may not have a homepage.", file=sys.stderr)
 
-    linked = None
-    if not args.force_new:
-        state = try_read_state(args.dir)
-        deploy_token = os.environ.get("HARVIS_DEPLOY_TOKEN") or (state or {}).get("deployToken")
-        if state and state.get("subdomain") and deploy_token:
-            linked = {"subdomain": state["subdomain"], "deployToken": deploy_token}
+    resolved = resolve_link(args.dir, args)
+    linked = None if args.force_new else resolved["target"]
+    if not args.force_new and resolved["subdomain"] and not linked:
+        print(f"No deploy token for {resolved['subdomain']} in {credentials_path()} — creating a new site.", file=sys.stderr)
+        print(f"Run `harvis link {resolved['subdomain']} --token <token>` to update it instead.", file=sys.stderr)
 
     use_zip = should_zip(files, total_bytes)
     zip_payload = build_zip(files) if use_zip else None
@@ -434,17 +548,10 @@ def deploy(args):
         print(f"Deploy failed: {message}", file=sys.stderr)
         sys.exit(1)
 
-    state = {
-        "url": body["url"],
-        "subdomain": body.get("subdomain"),
-        "name": body.get("name"),
-        "deployToken": body.get("deployToken"),
-        "deployedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    if body.get("claimUrl"):
-        state["claimUrl"] = body["claimUrl"]
-    write_state(args.dir, state)
-    ensure_gitignored(args.dir)
+    subdomain = body.get("subdomain") or (linked or {}).get("subdomain")
+    if subdomain:
+        remember_site(resolved["root"], subdomain, body)
+        write_link_file(resolved["root"], subdomain)
 
     print("")
     if linked:
@@ -460,7 +567,7 @@ def deploy(args):
         print("")
         print("The claim link is private and single-use: open it and sign in to")
         print("manage the site. Run `harvis claim` to open it in your browser.")
-        print("Unclaimed sites expire after 24 hours. Deploying this folder again")
+        print("Unclaimed sites expire after 24 hours. Deploying this project again")
         print("updates this same site.")
 
     if args.open_claim and body.get("claimUrl"):
@@ -473,12 +580,18 @@ def link(args):
         print("Usage: harvis link <subdomain> --token <token>", file=sys.stderr)
         print("Find the site's deploy token in the harvis.dev dashboard.", file=sys.stderr)
         sys.exit(1)
-    state = try_read_state(os.getcwd()) or {}
-    state["subdomain"] = args.subdomain
-    state["deployToken"] = deploy_token
-    write_state(os.getcwd(), state)
-    ensure_gitignored(os.getcwd())
-    print(f"Linked this folder to {args.subdomain}. Run `harvis` to deploy.")
+    root = find_project_root(os.getcwd())
+    creds = read_credentials()
+    previous = creds["projects"].get(root)
+    if previous and previous != args.subdomain:
+        creds["sites"].pop(previous, None)
+    site = creds["sites"].get(args.subdomain) or {}
+    site["deployToken"] = deploy_token
+    creds["sites"][args.subdomain] = site
+    creds["projects"][root] = args.subdomain
+    write_credentials(creds)
+    write_link_file(root, args.subdomain)
+    print(f"Linked {root} to {args.subdomain}. Run `harvis` to deploy.")
 
 
 def main():
@@ -489,16 +602,16 @@ def main():
     if args.command == "version":
         return print(__version__)
     if args.command == "claim":
-        state = read_state(os.getcwd())
-        if not state.get("claimUrl"):
-            print(f"No claim link in {STATE_FILE}.", file=sys.stderr)
+        site = require_site(os.getcwd())
+        if not site.get("claimUrl"):
+            print("No claim link for this site — it is already claimed, or was claimed elsewhere.", file=sys.stderr)
             sys.exit(1)
-        print(f"Opening claim link: {state['claimUrl']}")
-        return open_in_browser(state["claimUrl"])
+        print(f"Opening claim link: {site['claimUrl']}")
+        return open_in_browser(site["claimUrl"])
     if args.command == "open":
-        state = read_state(os.getcwd())
-        print(f"Opening live site: {state['url']}")
-        return open_in_browser(state["url"])
+        site = require_site(os.getcwd())
+        print(f"Opening live site: {site['url']}")
+        return open_in_browser(site["url"])
     if args.command == "link":
         return link(args)
     return deploy(args)
