@@ -45,7 +45,8 @@ Usage:
   harvis                     Deploy the current folder (updates the linked
                              site if this project has one, else creates one)
   harvis deploy [dir]        Deploy a folder (default: current folder)
-  harvis link <subdomain>    Link this project to an existing site
+  harvis link [subdomain]    Link this project to an existing site
+                             (--token is enough; the name is optional)
   harvis claim               Open the claim link of the last deploy
   harvis open                Open the live site of the last deploy
 
@@ -53,7 +54,8 @@ Options:
   --name <name>       Set the site name (default: from the page <title>)
   --new               Create a fresh site even if this project is linked
   --token <token>     Deploy token (or set HARVIS_DEPLOY_TOKEN)
-  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN)
+  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN); optional,
+                      the token already names the site — given, it must match
   --claim             After deploying, open the claim link in your browser
   -h, --help          Show this help
   -v, --version       Show version
@@ -70,7 +72,8 @@ so rebuilding or deleting the output folder never loses it.
 
 The token stays valid after you claim the site, and you can view or
 regenerate it in the dashboard — use it with \`harvis link\`, or set
-HARVIS_SUBDOMAIN and HARVIS_DEPLOY_TOKEN, to deploy from CI.
+HARVIS_DEPLOY_TOKEN, to deploy from CI. The token is the only secret
+CI needs: it identifies the site by itself.
 
 Unclaimed sites expire 24 hours after the last deploy. Claim a site to
 keep it online.`);
@@ -306,14 +309,19 @@ function credentialsPath() {
 }
 
 // { sites: { <subdomain>: { url, name, deployToken, claimUrl, deployedAt } },
-//   projects: { <projectRoot>: <subdomain> } }
+//   projects: { <projectRoot>: <subdomain> },
+//   tokens: { <projectRoot>: <deployToken> } }
+//
+// `tokens` holds a token linked before its site name is known — the server
+// resolves the site from the token, and the first deploy moves the entry
+// into `sites` under the subdomain it returns.
 function readCredentials() {
   try {
     const raw = JSON.parse(fs.readFileSync(credentialsPath(), "utf8"));
-    return { sites: raw.sites || {}, projects: raw.projects || {} };
+    return { sites: raw.sites || {}, projects: raw.projects || {}, tokens: raw.tokens || {} };
   } catch {
     // Missing or corrupt: start fresh rather than blocking the deploy.
-    return { sites: {}, projects: {} };
+    return { sites: {}, projects: {}, tokens: {} };
   }
 }
 
@@ -370,21 +378,29 @@ function writeLinkFile(root, subdomain) {
 
 // Where a deploy goes, in order: flags, env (CI), the committed link file,
 // then the per-user store keyed by project root.
+//
+// The token identifies the site on its own — the server resolves it — so a
+// token with no subdomain is a complete target. A subdomain alongside it is
+// sent as an assertion: the server rejects the pair if they disagree.
 function resolveLink(startDir, args) {
   const root = findProjectRoot(startDir);
   const creds = readCredentials();
   const link = readLinkFile(root);
-  const subdomain = (args && args.subdomain) || process.env.HARVIS_SUBDOMAIN
-    || (link && link.subdomain) || creds.projects[root] || null;
-  if (!subdomain) return { root, subdomain: null, site: null, target: null };
-  const site = creds.sites[subdomain] || null;
+  const requested = (args && args.subdomain) || process.env.HARVIS_SUBDOMAIN || null;
+  const subdomain = requested || (link && link.subdomain) || creds.projects[root] || null;
+  const site = subdomain ? creds.sites[subdomain] || null : null;
+  const parked = creds.tokens[root] || null;
   const deployToken = (args && args.token) || process.env.HARVIS_DEPLOY_TOKEN
-    || (site && site.deployToken) || null;
+    || (site && site.deployToken) || parked;
+  // A parked token (`harvis link --token`, no name given) is the most recent
+  // and most specific instruction there is, so let the server resolve the
+  // site rather than asserting a name left over from an earlier link.
+  const asserted = deployToken && deployToken === parked && !requested ? null : subdomain;
   return {
     root,
     subdomain,
     site,
-    target: deployToken ? { subdomain, deployToken } : null,
+    target: deployToken ? { subdomain: asserted, deployToken } : null,
   };
 }
 
@@ -405,6 +421,12 @@ function rememberSite(root, subdomain, body) {
   if (body.claimUrl) record.claimUrl = body.claimUrl;
   creds.sites[subdomain] = record;
   creds.projects[root] = subdomain;
+  // The site name is known now, so a token parked by `harvis link --token`
+  // has a home under `sites` and the placeholder can go.
+  if (creds.tokens[root]) {
+    if (!record.deployToken) creds.sites[subdomain].deployToken = creds.tokens[root];
+    delete creds.tokens[root];
+  }
   writeCredentials(creds);
 }
 
@@ -449,7 +471,7 @@ async function deploy(args) {
   const sizeNote = useZip
     ? `${fmtBytes(totalBytes)} → ${fmtBytes(zipPayload.length)} zipped`
     : fmtBytes(totalBytes);
-  const action = linked ? `Updating ${linked.subdomain}` : "Uploading";
+  const action = linked ? `Updating ${linked.subdomain || "the linked site"}` : "Uploading";
   console.log(`${action}: ${files.length} file${files.length === 1 ? "" : "s"} (${sizeNote})...`);
 
   async function postDeploy(target) {
@@ -460,7 +482,9 @@ async function deploy(args) {
       const q = new URLSearchParams();
       if (args.name) q.set("name", args.name);
       if (target) {
-        q.set("subdomain", target.subdomain);
+        // Optional: the token alone names the site. Sent when known so the
+        // server can refuse a token/site mismatch instead of overwriting.
+        if (target.subdomain) q.set("subdomain", target.subdomain);
         q.set("deployToken", target.deployToken);
       }
       const qs = q.toString();
@@ -471,7 +495,7 @@ async function deploy(args) {
       const fields = {};
       if (args.name) fields.name = args.name;
       if (target) {
-        fields.subdomain = target.subdomain;
+        if (target.subdomain) fields.subdomain = target.subdomain;
         fields.deployToken = target.deployToken;
       }
       ({ payload, contentType } = buildMultipart(files, fields));
@@ -487,12 +511,15 @@ async function deploy(args) {
   let { status, body } = await postDeploy(linked);
 
   if (linked && status === 404) {
-    console.log(`Site ${linked.subdomain} no longer exists (unclaimed sites expire after 24 hours). Creating a new site...`);
+    const gone = linked.subdomain ? `Site ${linked.subdomain}` : "The linked site";
+    console.log(`${gone} no longer exists (unclaimed sites expire after 24 hours). Creating a new site...`);
     linked = null;
     ({ status, body } = await postDeploy(null));
   } else if (linked && status === 403) {
-    console.error(`Deploy failed: the deploy token doesn't match site ${linked.subdomain}.`);
-    console.error("Get the current token from the dashboard and run `harvis link " + linked.subdomain + " --token <token>`,");
+    console.error(linked.subdomain
+      ? `Deploy failed: the deploy token doesn't match site ${linked.subdomain}.`
+      : "Deploy failed: the deploy token was not accepted.");
+    console.error("Get the current token from the dashboard and run `harvis link --token <token>`,");
     console.error("or run `harvis --new` to create a fresh site.");
     process.exit(1);
   }
@@ -532,8 +559,8 @@ async function deploy(args) {
 
 function link(args) {
   const deployToken = args.token || process.env.HARVIS_DEPLOY_TOKEN;
-  if (!args.subdomain || !deployToken) {
-    console.error("Usage: harvis link <subdomain> --token <token>");
+  if (!deployToken) {
+    console.error("Usage: harvis link --token <token>  (or: harvis link <subdomain> --token <token>)");
     console.error("Find the site's deploy token in the harvis.dev dashboard.");
     process.exit(1);
   }
@@ -541,11 +568,21 @@ function link(args) {
   const creds = readCredentials();
   const previous = creds.projects[root];
   if (previous && previous !== args.subdomain) delete creds.sites[previous];
-  creds.sites[args.subdomain] = { ...(creds.sites[args.subdomain] || {}), deployToken };
-  creds.projects[root] = args.subdomain;
+  if (args.subdomain) {
+    creds.sites[args.subdomain] = { ...(creds.sites[args.subdomain] || {}), deployToken };
+    creds.projects[root] = args.subdomain;
+    delete creds.tokens[root];
+  } else {
+    // No site name given: park the token until the first deploy reports
+    // which site it belongs to.
+    delete creds.projects[root];
+    creds.tokens[root] = deployToken;
+  }
   writeCredentials(creds);
-  writeLinkFile(root, args.subdomain);
-  console.log(`Linked ${root} to ${args.subdomain}. Run \`harvis\` to deploy.`);
+  if (args.subdomain) writeLinkFile(root, args.subdomain);
+  console.log(args.subdomain
+    ? `Linked ${root} to ${args.subdomain}. Run \`harvis\` to deploy.`
+    : `Linked ${root} to the token's site. Run \`harvis\` to deploy — the site name is recorded then.`);
 }
 
 async function main() {

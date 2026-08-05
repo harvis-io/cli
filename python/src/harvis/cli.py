@@ -51,7 +51,8 @@ Usage:
   harvis                     Deploy the current folder (updates the linked
                              site if this project has one, else creates one)
   harvis deploy [dir]        Deploy a folder (default: current folder)
-  harvis link <subdomain>    Link this project to an existing site
+  harvis link [subdomain]    Link this project to an existing site
+                             (--token is enough; the name is optional)
   harvis claim               Open the claim link of the last deploy
   harvis open                Open the live site of the last deploy
 
@@ -59,7 +60,8 @@ Options:
   --name <name>       Set the site name (default: from the page <title>)
   --new               Create a fresh site even if this project is linked
   --token <token>     Deploy token (or set HARVIS_DEPLOY_TOKEN)
-  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN)
+  --subdomain <sub>   Deploy to this site (or set HARVIS_SUBDOMAIN); optional,
+                      the token already names the site — given, it must match
   --claim             After deploying, open the claim link in your browser
   -h, --help          Show this help
   -v, --version       Show version
@@ -76,7 +78,8 @@ so rebuilding or deleting the output folder never loses it.
 
 The token stays valid after you claim the site, and you can view or
 regenerate it in the dashboard — use it with `harvis link`, or set
-HARVIS_SUBDOMAIN and HARVIS_DEPLOY_TOKEN, to deploy from CI.
+HARVIS_DEPLOY_TOKEN, to deploy from CI. The token is the only secret
+CI needs: it identifies the site by itself.
 
 Unclaimed sites expire 24 hours after the last deploy. Claim a site to
 keep it online.""")
@@ -354,14 +357,23 @@ def credentials_path():
 
 def read_credentials():
     """{"sites": {<subdomain>: {url, name, deployToken, claimUrl, deployedAt}},
-    "projects": {<projectRoot>: <subdomain>}}"""
+    "projects": {<projectRoot>: <subdomain>},
+    "tokens": {<projectRoot>: <deployToken>}}
+
+    `tokens` holds a token linked before its site name is known — the server
+    resolves the site from the token, and the first deploy moves the entry
+    into `sites` under the subdomain it returns."""
     try:
         with open(credentials_path(), encoding="utf-8") as f:
             raw = json.load(f)
-        return {"sites": raw.get("sites") or {}, "projects": raw.get("projects") or {}}
+        return {
+            "sites": raw.get("sites") or {},
+            "projects": raw.get("projects") or {},
+            "tokens": raw.get("tokens") or {},
+        }
     except (OSError, ValueError):
         # Missing or corrupt: start fresh rather than blocking the deploy.
-        return {"sites": {}, "projects": {}}
+        return {"sites": {}, "projects": {}, "tokens": {}}
 
 
 def write_credentials(creds):
@@ -423,25 +435,29 @@ def write_link_file(root, subdomain):
 
 def resolve_link(start_dir, args=None):
     """Where a deploy goes, in order: flags, env (CI), the committed link
-    file, then the per-user store keyed by project root."""
+    file, then the per-user store keyed by project root.
+
+    The token identifies the site on its own — the server resolves it — so a
+    token with no subdomain is a complete target. A subdomain alongside it is
+    sent as an assertion: the server rejects the pair if they disagree."""
     root = find_project_root(start_dir)
     creds = read_credentials()
     link = read_link_file(root)
-    subdomain = (
-        (args.subdomain if args else None)
-        or os.environ.get("HARVIS_SUBDOMAIN")
-        or (link or {}).get("subdomain")
-        or creds["projects"].get(root)
-    )
-    if not subdomain:
-        return {"root": root, "subdomain": None, "site": None, "target": None}
-    site = creds["sites"].get(subdomain)
+    requested = (args.subdomain if args else None) or os.environ.get("HARVIS_SUBDOMAIN")
+    subdomain = requested or (link or {}).get("subdomain") or creds["projects"].get(root)
+    site = creds["sites"].get(subdomain) if subdomain else None
+    parked = creds["tokens"].get(root)
     deploy_token = (
         (args.token if args else None)
         or os.environ.get("HARVIS_DEPLOY_TOKEN")
         or (site or {}).get("deployToken")
+        or parked
     )
-    target = {"subdomain": subdomain, "deployToken": deploy_token} if deploy_token else None
+    # A parked token (`harvis link --token`, no name given) is the most recent
+    # and most specific instruction there is, so let the server resolve the
+    # site rather than asserting a name left over from an earlier link.
+    asserted = None if deploy_token and deploy_token == parked and not requested else subdomain
+    target = {"subdomain": asserted, "deployToken": deploy_token} if deploy_token else None
     return {"root": root, "subdomain": subdomain, "site": site, "target": target}
 
 
@@ -464,6 +480,12 @@ def remember_site(root, subdomain, body):
         record["claimUrl"] = body["claimUrl"]
     creds["sites"][subdomain] = record
     creds["projects"][root] = subdomain
+    # The site name is known now, so a token parked by `harvis link --token`
+    # has a home under `sites` and the placeholder can go.
+    if creds["tokens"].get(root):
+        if not record["deployToken"]:
+            record["deployToken"] = creds["tokens"][root]
+        del creds["tokens"][root]
     write_credentials(creds)
 
 
@@ -505,7 +527,7 @@ def deploy(args):
         if use_zip
         else fmt_bytes(total_bytes)
     )
-    action = f"Updating {linked['subdomain']}" if linked else "Uploading"
+    action = f"Updating {linked['subdomain'] or 'the linked site'}" if linked else "Uploading"
     plural = "" if len(files) == 1 else "s"
     print(f"{action}: {len(files)} file{plural} ({size_note})...")
 
@@ -517,7 +539,11 @@ def deploy(args):
             if args.name:
                 params["name"] = args.name
             if target:
-                params["subdomain"] = target["subdomain"]
+                # Optional: the token alone names the site. Sent when known so
+                # the server can refuse a token/site mismatch instead of
+                # overwriting.
+                if target["subdomain"]:
+                    params["subdomain"] = target["subdomain"]
                 params["deployToken"] = target["deployToken"]
             if params:
                 url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
@@ -526,7 +552,8 @@ def deploy(args):
         if args.name:
             fields["name"] = args.name
         if target:
-            fields["subdomain"] = target["subdomain"]
+            if target["subdomain"]:
+                fields["subdomain"] = target["subdomain"]
             fields["deployToken"] = target["deployToken"]
         payload, content_type = build_multipart(files, fields)
         return upload(url, payload, content_type)
@@ -534,12 +561,18 @@ def deploy(args):
     status, body = post_deploy(linked)
 
     if linked and status == 404:
-        print(f"Site {linked['subdomain']} no longer exists (unclaimed sites expire after 24 hours). Creating a new site...")
+        gone = f"Site {linked['subdomain']}" if linked["subdomain"] else "The linked site"
+        print(f"{gone} no longer exists (unclaimed sites expire after 24 hours). Creating a new site...")
         linked = None
         status, body = post_deploy(None)
     elif linked and status == 403:
-        print(f"Deploy failed: the deploy token doesn't match site {linked['subdomain']}.", file=sys.stderr)
-        print("Get the current token from the dashboard and run `harvis link " + linked["subdomain"] + " --token <token>`,", file=sys.stderr)
+        print(
+            f"Deploy failed: the deploy token doesn't match site {linked['subdomain']}."
+            if linked["subdomain"]
+            else "Deploy failed: the deploy token was not accepted.",
+            file=sys.stderr,
+        )
+        print("Get the current token from the dashboard and run `harvis link --token <token>`,", file=sys.stderr)
         print("or run `harvis --new` to create a fresh site.", file=sys.stderr)
         sys.exit(1)
 
@@ -576,8 +609,8 @@ def deploy(args):
 
 def link(args):
     deploy_token = args.token or os.environ.get("HARVIS_DEPLOY_TOKEN")
-    if not args.subdomain or not deploy_token:
-        print("Usage: harvis link <subdomain> --token <token>", file=sys.stderr)
+    if not deploy_token:
+        print("Usage: harvis link --token <token>  (or: harvis link <subdomain> --token <token>)", file=sys.stderr)
         print("Find the site's deploy token in the harvis.dev dashboard.", file=sys.stderr)
         sys.exit(1)
     root = find_project_root(os.getcwd())
@@ -585,13 +618,23 @@ def link(args):
     previous = creds["projects"].get(root)
     if previous and previous != args.subdomain:
         creds["sites"].pop(previous, None)
-    site = creds["sites"].get(args.subdomain) or {}
-    site["deployToken"] = deploy_token
-    creds["sites"][args.subdomain] = site
-    creds["projects"][root] = args.subdomain
+    if args.subdomain:
+        site = creds["sites"].get(args.subdomain) or {}
+        site["deployToken"] = deploy_token
+        creds["sites"][args.subdomain] = site
+        creds["projects"][root] = args.subdomain
+        creds["tokens"].pop(root, None)
+    else:
+        # No site name given: park the token until the first deploy reports
+        # which site it belongs to.
+        creds["projects"].pop(root, None)
+        creds["tokens"][root] = deploy_token
     write_credentials(creds)
-    write_link_file(root, args.subdomain)
-    print(f"Linked {root} to {args.subdomain}. Run `harvis` to deploy.")
+    if args.subdomain:
+        write_link_file(root, args.subdomain)
+        print(f"Linked {root} to {args.subdomain}. Run `harvis` to deploy.")
+    else:
+        print(f"Linked {root} to the token's site. Run `harvis` to deploy — the site name is recorded then.")
 
 
 def main():
