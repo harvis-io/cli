@@ -34,7 +34,7 @@ manage the site. Run `harvis claim` to open it in your browser.
 | --- | --- |
 | `harvis` | Deploy the current folder (updates the linked site, or creates one) |
 | `harvis deploy [dir]` | Deploy a specific folder |
-| `harvis link <subdomain>` | Link this project to an existing site |
+| `harvis link [subdomain]` | Link this project to an existing site (`--token` is enough) |
 | `harvis claim` | Open the last deploy's claim link in your browser |
 | `harvis open` | Open the last deploy's live site in your browser |
 
@@ -43,7 +43,7 @@ manage the site. Run `harvis claim` to open it in your browser.
 - `--name <name>` — set the site name (defaults to the page `<title>`)
 - `--new` — create a fresh site even if this project is already linked to one
 - `--token <token>` — deploy token (or set `HARVIS_DEPLOY_TOKEN`)
-- `--subdomain <sub>` — deploy to this site (or set `HARVIS_SUBDOMAIN`)
+- `--subdomain <sub>` — deploy to this site (or set `HARVIS_SUBDOMAIN`). Optional: the deploy token already names the site. When given, it must match the token's site, so it acts as a guard against deploying to the wrong one.
 - `--claim` — open the claim link in your browser right after deploying
 
 ## Updating a site
@@ -57,18 +57,27 @@ Every later deploy from the same project sends that token and updates the same s
 
 The project root is found by walking up from the folder being deployed, looking for `harvis.json`, `.git`, `package.json`, `pyproject.toml` and friends — so `harvis deploy dist` links the project, not the build output.
 
-To deploy an existing site from another machine, link the project once:
+To deploy an existing site from another machine, link the project once. The
+token identifies the site by itself, so the subdomain is optional — the first
+deploy learns the name from the server and writes `harvis.json`:
 
 ```bash
-harvis link happy-panda-482 --token <token-from-dashboard>
+harvis link --token <token-from-dashboard>
 harvis
 ```
 
-In CI, set the environment instead of running `link`:
+Name it as well if you want the check that you grabbed the right token — a
+mismatch fails the deploy instead of overwriting the other site:
+
+```bash
+harvis link happy-panda-482 --token <token-from-dashboard>
+```
+
+In CI, set the environment instead of running `link`. The token is the only
+secret needed:
 
 ```bash
 export HARVIS_DEPLOY_TOKEN=<token-from-dashboard>
-export HARVIS_SUBDOMAIN=happy-panda-482   # optional if harvis.json is committed
 harvis deploy dist
 ```
 
