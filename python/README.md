@@ -83,6 +83,26 @@ harvis deploy dist
 
 To start over with a fresh URL, run `harvis --new`.
 
+## Uninstalling
+
+Depending on how you installed it:
+
+```bash
+pip uninstall harvis          # pip install harvis
+uv tool uninstall harvis      # uv tool install harvis
+pipx uninstall harvis         # pipx install harvis
+```
+
+If you only ever ran `uvx harvis`, nothing was installed — drop the cached copy with `uv cache clean harvis`.
+
+None of these remove your deploy tokens. To delete those too:
+
+```bash
+rm -rf ~/.config/harvis
+```
+
+(`%APPDATA%\harvis` on Windows, or wherever `XDG_CONFIG_HOME` / `HARVIS_CONFIG_DIR` points.) Tokens can also be regenerated from the dashboard, and `harvis.json` in a project is just the site name — delete it if you no longer want the project linked.
+
 ## Notes
 
 - Uploads are zipped when the folder compresses well (HTML/CSS/JS shrink ~60-70%); folders that are mostly already-compressed media (images, video, fonts) upload as raw multipart instead. A progress bar is shown on interactive terminals.

@@ -83,6 +83,24 @@ harvis deploy dist
 
 To start over with a fresh URL, run `harvis --new`.
 
+## Uninstalling
+
+Remove the global install:
+
+```bash
+npm uninstall -g harvis
+```
+
+If you ran it with `npx`, nothing was installed globally — clear the cached copy with `npx clear-npx-cache` (or delete `~/.npm/_npx`).
+
+Neither removes your deploy tokens. To delete those too:
+
+```bash
+rm -rf ~/.config/harvis
+```
+
+(`%APPDATA%\harvis` on Windows, or wherever `XDG_CONFIG_HOME` / `HARVIS_CONFIG_DIR` points.) Tokens can also be regenerated from the dashboard, and `harvis.json` in a project is just the site name — delete it if you no longer want the project linked.
+
 ## Notes
 
 - Uploads are zipped when the folder compresses well (HTML/CSS/JS shrink ~60-70%); folders that are mostly already-compressed media (images, video, fonts) upload as raw multipart instead. A progress bar is shown on interactive terminals.
