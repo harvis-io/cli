@@ -29,6 +29,12 @@ jobs:
         run: node bin/harvis.js --version
       - name: Pack
         run: npm pack --dry-run
+      - name: Pack the hosting alias
+        run: |
+          node scripts/alias-package.js hosting
+          node -e "const p=require('./package.json'); if (p.name !== 'hosting' || !p.bin.hosting) process.exit(1)"
+          npm pack --dry-run
+          git checkout package.json
 
   python:
     runs-on: ubuntu-latest

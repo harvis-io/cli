@@ -11,6 +11,11 @@ const { zipSync } = require("fflate");
 
 const VERSION = require("../package.json").version;
 const API_URL = process.env.HARVIS_API_URL || "https://harvis.dev/api/upload";
+
+// The same CLI ships under two npm names, `harvis` and `hosting`, so help and
+// error text echoes whichever command the user typed. On Windows the shim runs
+// the real file path, which falls back to the default.
+const CMD = path.basename(process.argv[1] || "", ".js") === "hosting" ? "hosting" : "harvis";
 const MAX_FILES = 500;
 const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
 
@@ -39,16 +44,17 @@ const COMPRESSIBLE_EXTENSIONS = new Set([
 ]);
 
 function printHelp() {
-  console.log(`harvis — deploy the current folder to harvis.dev
+  const WIDTH = 27;
+  const row = (usage, ...lines) =>
+    [`  ${usage.padEnd(WIDTH)}${lines[0]}`, ...lines.slice(1).map((l) => " ".repeat(WIDTH + 2) + l)].join("\n");
+  console.log(`${CMD} — deploy the current folder to harvis.dev
 
 Usage:
-  harvis                     Deploy the current folder (updates the linked
-                             site if this project has one, else creates one)
-  harvis deploy [dir]        Deploy a folder (default: current folder)
-  harvis link [subdomain]    Link this project to an existing site
-                             (--token is enough; the name is optional)
-  harvis claim               Open the claim link of the last deploy
-  harvis open                Open the live site of the last deploy
+${row(CMD, "Deploy the current folder (updates the linked", "site if this project has one, else creates one)")}
+${row(`${CMD} deploy [dir]`, "Deploy a folder (default: current folder)")}
+${row(`${CMD} link [subdomain]`, "Link this project to an existing site", "(--token is enough; the name is optional)")}
+${row(`${CMD} claim`, "Open the claim link of the last deploy")}
+${row(`${CMD} open`, "Open the live site of the last deploy")}
 
 Options:
   --name <name>       Set the site name (default: from the page <title>)
@@ -71,7 +77,7 @@ and the deploy token is stored per user in
 so rebuilding or deleting the output folder never loses it.
 
 The token stays valid after you claim the site, and you can view or
-regenerate it in the dashboard — use it with \`harvis link\`, or set
+regenerate it in the dashboard — use it with \`${CMD} link\`, or set
 HARVIS_DEPLOY_TOKEN, to deploy from CI. The token is the only secret
 CI needs: it identifies the site by itself.
 
@@ -98,7 +104,7 @@ function parseArgs(argv) {
     else if (a === "--subdomain") args.subdomain = argv[++i] || null;
     else if (a.startsWith("--subdomain=")) args.subdomain = a.slice("--subdomain=".length);
     else if (a.startsWith("-")) {
-      console.error(`Unknown option: ${a} (see: harvis --help)`);
+      console.error(`Unknown option: ${a} (see: ${CMD} --help)`);
       process.exit(1);
     } else rest.push(a);
   }
@@ -433,12 +439,12 @@ function rememberSite(root, subdomain, body) {
 function requireSite(startDir) {
   const { subdomain, site } = resolveLink(startDir, null);
   if (!subdomain) {
-    console.error("This project is not linked to a site yet. Deploy first with: harvis");
+    console.error(`This project is not linked to a site yet. Deploy first with: ${CMD}`);
     process.exit(1);
   }
   if (!site || !site.url) {
     console.error(`No local record of ${subdomain} in ${credentialsPath()}.`);
-    console.error("Deploy again with `harvis`, or run `harvis link " + subdomain + " --token <token>`.");
+    console.error(`Deploy again with \`${CMD}\`, or run \`${CMD} link ${subdomain} --token <token>\`.`);
     process.exit(1);
   }
   return site;
@@ -463,7 +469,7 @@ async function deploy(args) {
   let linked = args.forceNew ? null : resolved.target;
   if (!args.forceNew && resolved.subdomain && !linked) {
     console.error(`No deploy token for ${resolved.subdomain} in ${credentialsPath()} — creating a new site.`);
-    console.error(`Run \`harvis link ${resolved.subdomain} --token <token>\` to update it instead.`);
+    console.error(`Run \`${CMD} link ${resolved.subdomain} --token <token>\` to update it instead.`);
   }
 
   const useZip = shouldZip(files, totalBytes);
@@ -519,8 +525,8 @@ async function deploy(args) {
     console.error(linked.subdomain
       ? `Deploy failed: the deploy token doesn't match site ${linked.subdomain}.`
       : "Deploy failed: the deploy token was not accepted.");
-    console.error("Get the current token from the dashboard and run `harvis link --token <token>`,");
-    console.error("or run `harvis --new` to create a fresh site.");
+    console.error(`Get the current token from the dashboard and run \`${CMD} link --token <token>\`,`);
+    console.error(`or run \`${CMD} --new\` to create a fresh site.`);
     process.exit(1);
   }
 
@@ -542,14 +548,14 @@ async function deploy(args) {
     if (body.claimUrl) {
       console.log("");
       console.log("This site is still unclaimed and expires 24 hours after the last");
-      console.log("deploy. Run `harvis claim` to keep it online permanently.");
+      console.log(`deploy. Run \`${CMD} claim\` to keep it online permanently.`);
     }
   } else {
     console.log(`  Live site:   ${body.url}`);
     if (body.claimUrl) console.log(`  Claim link:  ${body.claimUrl}`);
     console.log("");
     console.log("The claim link is private and single-use: open it and sign in to");
-    console.log("manage the site. Run `harvis claim` to open it in your browser.");
+    console.log(`manage the site. Run \`${CMD} claim\` to open it in your browser.`);
     console.log("Unclaimed sites expire after 24 hours. Deploying this project again");
     console.log("updates this same site.");
   }
@@ -560,7 +566,7 @@ async function deploy(args) {
 function link(args) {
   const deployToken = args.token || process.env.HARVIS_DEPLOY_TOKEN;
   if (!deployToken) {
-    console.error("Usage: harvis link --token <token>  (or: harvis link <subdomain> --token <token>)");
+    console.error(`Usage: ${CMD} link --token <token>  (or: ${CMD} link <subdomain> --token <token>)`);
     console.error("Find the site's deploy token in the harvis.dev dashboard.");
     process.exit(1);
   }
@@ -581,8 +587,8 @@ function link(args) {
   writeCredentials(creds);
   if (args.subdomain) writeLinkFile(root, args.subdomain);
   console.log(args.subdomain
-    ? `Linked ${root} to ${args.subdomain}. Run \`harvis\` to deploy.`
-    : `Linked ${root} to the token's site. Run \`harvis\` to deploy — the site name is recorded then.`);
+    ? `Linked ${root} to ${args.subdomain}. Run \`${CMD}\` to deploy.`
+    : `Linked ${root} to the token's site. Run \`${CMD}\` to deploy — the site name is recorded then.`);
 }
 
 async function main() {

@@ -13,6 +13,8 @@ This repository hosts the harvis CLI for multiple languages, one per folder:
 
 Both implementations share the same commands, options, and behavior — see each folder's README for details.
 
+The Node package is also published under the name [`hosting`](https://www.npmjs.com/package/hosting) — same code, same version, invoked as `hosting` instead of `harvis`. Install either one, not both.
+
 ```
 Uploading 3 files (12.4 KB)...
 

@@ -16,6 +16,14 @@ or without installing:
 npx harvis
 ```
 
+The same CLI is also published as [`hosting`](https://www.npmjs.com/package/hosting) — identical code and version, invoked as `hosting`:
+
+```bash
+npx hosting
+```
+
+Pick one; installing both globally just puts two names for the same tool on your PATH. Everything below applies to either, with the command name swapped.
+
 Output:
 
 ```

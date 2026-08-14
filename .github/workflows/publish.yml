@@ -32,6 +32,19 @@ jobs:
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Same code, second name: `hosting` is the discoverable alias of `harvis`.
+      - name: Publish alias
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "hosting@$VERSION" version >/dev/null 2>&1; then
+            echo "hosting@$VERSION already on npm, skipping"
+          else
+            node scripts/alias-package.js hosting
+            npm publish --provenance --access public
+            git checkout package.json
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   pypi:
     runs-on: ubuntu-latest
