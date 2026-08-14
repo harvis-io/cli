@@ -20,6 +20,16 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Publishing is via trusted publishing (OIDC): npm mints a short-lived
+      # credential from this workflow's identity, so no token has to live in
+      # repository secrets. Needs npm 11.5.1+, newer than the one bundled with
+      # Node 22. Both `harvis` and `hosting` must name this repo and workflow
+      # file as their trusted publisher on npmjs.com. NPM_TOKEN below is only a
+      # fallback for a package not yet configured — drop it once both are.
+      # --provenance stays explicit: OIDC generates it on its own, the token
+      # fallback does not.
+      - name: Update npm
+        run: npm install -g npm@latest
       - name: Syntax check
         run: node --check bin/harvis.js
       - name: Publish
@@ -60,5 +70,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Build
         run: uv build
+      # --check-url skips files already on PyPI instead of failing the job, so
+      # this workflow can be re-run when only the npm half of a release failed.
       - name: Publish
-        run: uv publish
+        run: uv publish --check-url https://pypi.org/simple/
