@@ -21,13 +21,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       # Publishing is via trusted publishing (OIDC): npm mints a short-lived
-      # credential from this workflow's identity, so no token has to live in
-      # repository secrets. Needs npm 11.5.1+, newer than the one bundled with
-      # Node 22. Both `harvis` and `hosting` must name this repo and workflow
-      # file as their trusted publisher on npmjs.com. NPM_TOKEN below is only a
-      # fallback for a package not yet configured — drop it once both are.
-      # --provenance stays explicit: OIDC generates it on its own, the token
-      # fallback does not.
+      # credential from this workflow's identity, so no token is stored here
+      # at all. Needs npm 11.5.1+, newer than the one bundled with Node 22.
+      # Both `harvis` and `hosting` must name this repo and this workflow file
+      # as their trusted publisher on npmjs.com — a package that doesn't fails
+      # with ENEEDAUTH rather than publishing as somebody's leftover token.
       - name: Update npm
         run: npm install -g npm@latest
       - name: Syntax check
@@ -40,8 +38,6 @@ jobs:
           else
             npm publish --provenance --access public
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       # Same code, second name: `hosting` is the discoverable alias of `harvis`.
       - name: Publish alias
         run: |
@@ -53,8 +49,6 @@ jobs:
             npm publish --provenance --access public
             git checkout package.json
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   pypi:
     runs-on: ubuntu-latest
