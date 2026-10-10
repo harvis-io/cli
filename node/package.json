@@ -1,6 +1,6 @@
 {
   "name": "harvis",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Deploy the current folder to harvis.dev with one command.",
   "bin": {
     "harvis": "bin/harvis.js"
