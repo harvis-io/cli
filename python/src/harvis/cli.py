@@ -19,21 +19,19 @@ API_URL = os.environ.get("HARVIS_API_URL", "https://harvis.dev/api/upload")
 MAX_FILES = 500
 MAX_PROJECT_BYTES = 50 * 1024 * 1024
 
-# Deploy tokens live in a per-user store outside the project, so a rebuild
-# that wipes the output folder cannot lose them. Only the (non-secret) site
-# name is kept in the project, in a file that is safe to commit.
+# Site links and deploy tokens live in a per-user store outside the project,
+# so a rebuild that wipes the output folder cannot lose them and nothing is
+# written into the project itself.
 CREDENTIALS_FILE = "credentials.json"
-LINK_FILE = "harvis.json"
 
-# Anything that marks the top of a project. The link file is included so a
-# second deploy finds the link even in a folder with no other marker.
+# Anything that marks the top of a project.
 PROJECT_MARKERS = (
-    LINK_FILE, ".git", "package.json", "pyproject.toml", "deno.json",
+    ".git", "package.json", "pyproject.toml", "deno.json",
     "deno.jsonc", "go.mod", "Cargo.toml", "Gemfile", "composer.json",
 )
 
 IGNORED_DIRS = {"node_modules", "__MACOSX"}
-IGNORED_FILES = {"Thumbs.db", "desktop.ini", LINK_FILE, ".harvis.json"}
+IGNORED_FILES = {"Thumbs.db", "desktop.ini", "harvis.json"}
 
 # Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
 # already compressed, so zipping them gains nothing.
@@ -70,11 +68,10 @@ The first deploy prints two links:
   Live site   — public URL of your site
   Claim link  — private, single-use; open it and sign in to manage the site
 
-Later deploys from the same project update the same site. The site name is
-recorded in {LINK_FILE} at the project root (no secrets — safe to commit),
-and the deploy token is stored per user in
+Later deploys from the same project update the same site. The link and the
+deploy token are stored per user in
   {credentials_path()}
-so rebuilding or deleting the output folder never loses it.
+so rebuilding or deleting the output folder never loses them.
 
 The token stays valid after you claim the site, and you can view or
 regenerate it in the dashboard — use it with `harvis link`, or set
@@ -393,8 +390,8 @@ def write_credentials(creds):
 
 
 def find_project_root(start_dir):
-    """The project root is where the link file goes: walking up from the
-    deployed folder means `harvis deploy dist` links the project, not the
+    """The project root is the key a link is stored under: walking up from
+    the deployed folder means `harvis deploy dist` links the project, not the
     build output."""
     home = os.path.expanduser("~")
     directory = start_dir
@@ -408,43 +405,17 @@ def find_project_root(start_dir):
         directory = parent
 
 
-def read_link_file(root):
-    try:
-        with open(os.path.join(root, LINK_FILE), encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, dict) and isinstance(raw.get("subdomain"), str):
-            return raw
-        return None
-    except (OSError, ValueError):
-        return None
-
-
-def write_link_file(root, subdomain):
-    existing = read_link_file(root)
-    if existing and existing.get("subdomain") == subdomain:
-        return
-    try:
-        with open(os.path.join(root, LINK_FILE), "w", encoding="utf-8") as f:
-            f.write(json.dumps({"subdomain": subdomain}, indent=2) + "\n")
-        if not existing:
-            print(f"Wrote {os.path.join(root, LINK_FILE)} (site name only — safe to commit).")
-    except OSError:
-        # Best-effort: the credential store already remembers this project.
-        pass
-
-
 def resolve_link(start_dir, args=None):
-    """Where a deploy goes, in order: flags, env (CI), the committed link
-    file, then the per-user store keyed by project root.
+    """Where a deploy goes, in order: flags, env (CI), then the per-user
+    store keyed by project root.
 
     The token identifies the site on its own — the server resolves it — so a
     token with no subdomain is a complete target. A subdomain alongside it is
     sent as an assertion: the server rejects the pair if they disagree."""
     root = find_project_root(start_dir)
     creds = read_credentials()
-    link = read_link_file(root)
     requested = (args.subdomain if args else None) or os.environ.get("HARVIS_SUBDOMAIN")
-    subdomain = requested or (link or {}).get("subdomain") or creds["projects"].get(root)
+    subdomain = requested or creds["projects"].get(root)
     site = creds["sites"].get(subdomain) if subdomain else None
     parked = creds["tokens"].get(root)
     deploy_token = (
@@ -584,7 +555,6 @@ def deploy(args):
     subdomain = body.get("subdomain") or (linked or {}).get("subdomain")
     if subdomain:
         remember_site(resolved["root"], subdomain, body)
-        write_link_file(resolved["root"], subdomain)
 
     print("")
     if linked:
@@ -631,7 +601,6 @@ def link(args):
         creds["tokens"][root] = deploy_token
     write_credentials(creds)
     if args.subdomain:
-        write_link_file(root, args.subdomain)
         print(f"Linked {root} to {args.subdomain}. Run `harvis` to deploy.")
     else:
         print(f"Linked {root} to the token's site. Run `harvis` to deploy — the site name is recorded then.")
