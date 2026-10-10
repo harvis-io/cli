@@ -19,21 +19,19 @@ const CMD = path.basename(process.argv[1] || "", ".js") === "hosting" ? "hosting
 const MAX_FILES = 500;
 const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
 
-// Deploy tokens live in a per-user store outside the project, so a rebuild
-// that wipes the output folder cannot lose them. Only the (non-secret) site
-// name is kept in the project, in a file that is safe to commit.
+// Site links and deploy tokens live in a per-user store outside the project,
+// so a rebuild that wipes the output folder cannot lose them and nothing is
+// written into the project itself.
 const CREDENTIALS_FILE = "credentials.json";
-const LINK_FILE = "harvis.json";
 
-// Anything that marks the top of a project. The link file is included so a
-// second deploy finds the link even in a folder with no other marker.
+// Anything that marks the top of a project.
 const PROJECT_MARKERS = [
-  LINK_FILE, ".git", "package.json", "pyproject.toml", "deno.json",
+  ".git", "package.json", "pyproject.toml", "deno.json",
   "deno.jsonc", "go.mod", "Cargo.toml", "Gemfile", "composer.json",
 ];
 
 const IGNORED_DIRS = new Set(["node_modules", "__MACOSX"]);
-const IGNORED_FILES = new Set(["Thumbs.db", "desktop.ini", LINK_FILE, ".harvis.json"]);
+const IGNORED_FILES = new Set(["Thumbs.db", "desktop.ini", "harvis.json"]);
 
 // Formats that deflate well. Media formats (png, jpg, woff2, mp4…) are
 // already compressed, so zipping them gains nothing.
@@ -70,11 +68,10 @@ The first deploy prints two links:
   Live site   — public URL of your site
   Claim link  — private, single-use; open it and sign in to manage the site
 
-Later deploys from the same project update the same site. The site name is
-recorded in ${LINK_FILE} at the project root (no secrets — safe to commit),
-and the deploy token is stored per user in
+Later deploys from the same project update the same site. The link and the
+deploy token are stored per user in
   ${credentialsPath()}
-so rebuilding or deleting the output folder never loses it.
+so rebuilding or deleting the output folder never loses them.
 
 The token stays valid after you claim the site, and you can view or
 regenerate it in the dashboard — use it with \`${CMD} link\`, or set
@@ -346,8 +343,9 @@ function writeCredentials(creds) {
   }
 }
 
-// The project root is where the link file goes: walking up from the deployed
-// folder means `harvis deploy dist` links the project, not the build output.
+// The project root is the key a link is stored under: walking up from the
+// deployed folder means `harvis deploy dist` links the project, not the build
+// output.
 function findProjectRoot(startDir) {
   const home = os.homedir();
   let dir = startDir;
@@ -360,30 +358,8 @@ function findProjectRoot(startDir) {
   }
 }
 
-function readLinkFile(root) {
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(root, LINK_FILE), "utf8"));
-    return raw && typeof raw.subdomain === "string" ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeLinkFile(root, subdomain) {
-  const existing = readLinkFile(root);
-  if (existing && existing.subdomain === subdomain) return;
-  try {
-    fs.writeFileSync(path.join(root, LINK_FILE), JSON.stringify({ subdomain }, null, 2) + "\n");
-    if (!existing) {
-      console.log(`Wrote ${path.join(root, LINK_FILE)} (site name only — safe to commit).`);
-    }
-  } catch {
-    // Best-effort: the credential store already remembers this project.
-  }
-}
-
-// Where a deploy goes, in order: flags, env (CI), the committed link file,
-// then the per-user store keyed by project root.
+// Where a deploy goes, in order: flags, env (CI), then the per-user store
+// keyed by project root.
 //
 // The token identifies the site on its own — the server resolves it — so a
 // token with no subdomain is a complete target. A subdomain alongside it is
@@ -391,9 +367,8 @@ function writeLinkFile(root, subdomain) {
 function resolveLink(startDir, args) {
   const root = findProjectRoot(startDir);
   const creds = readCredentials();
-  const link = readLinkFile(root);
   const requested = (args && args.subdomain) || process.env.HARVIS_SUBDOMAIN || null;
-  const subdomain = requested || (link && link.subdomain) || creds.projects[root] || null;
+  const subdomain = requested || creds.projects[root] || null;
   const site = subdomain ? creds.sites[subdomain] || null : null;
   const parked = creds.tokens[root] || null;
   const deployToken = (args && args.token) || process.env.HARVIS_DEPLOY_TOKEN
@@ -539,7 +514,6 @@ async function deploy(args) {
   const subdomain = body.subdomain || (linked && linked.subdomain);
   if (subdomain) {
     rememberSite(resolved.root, subdomain, body);
-    writeLinkFile(resolved.root, subdomain);
   }
 
   console.log("");
@@ -585,7 +559,6 @@ function link(args) {
     creds.tokens[root] = deployToken;
   }
   writeCredentials(creds);
-  if (args.subdomain) writeLinkFile(root, args.subdomain);
   console.log(args.subdomain
     ? `Linked ${root} to ${args.subdomain}. Run \`${CMD}\` to deploy.`
     : `Linked ${root} to the token's site. Run \`${CMD}\` to deploy — the site name is recorded then.`);

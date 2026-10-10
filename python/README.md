@@ -48,18 +48,15 @@ manage the site. Run `harvis claim` to open it in your browser.
 
 ## Updating a site
 
-The first deploy creates a site and records it in two places:
-
-- **`harvis.json`** at your project root — the site name only, no secrets. Commit it, and every clone of the project deploys to the same site.
-- **`~/.config/harvis/credentials.json`** — the **deploy token**, stored per user with `0600` permissions. Because it lives outside the project, rebuilding or deleting your output folder never loses it. (`%APPDATA%\harvis\credentials.json` on Windows; honours `XDG_CONFIG_HOME`, or `HARVIS_CONFIG_DIR` to override.)
+The first deploy creates a site and records the link to it, along with its **deploy token**, in `~/.config/harvis/credentials.json` — stored per user with `0600` permissions. Nothing is written into your project, and because the record lives outside it, rebuilding or deleting your output folder never loses it. (`%APPDATA%\harvis\credentials.json` on Windows; honours `XDG_CONFIG_HOME`, or `HARVIS_CONFIG_DIR` to override.)
 
 Every later deploy from the same project sends that token and updates the same site — before *and* after you claim it. Claiming attaches the site to your account; the token keeps working, and you can view or regenerate it in the dashboard.
 
-The project root is found by walking up from the folder being deployed, looking for `harvis.json`, `.git`, `package.json`, `pyproject.toml` and friends — so `harvis deploy dist` links the project, not the build output.
+The project root is found by walking up from the folder being deployed, looking for `.git`, `package.json`, `pyproject.toml` and friends — so `harvis deploy dist` links the project, not the build output.
 
 To deploy an existing site from another machine, link the project once. The
 token identifies the site by itself, so the subdomain is optional — the first
-deploy learns the name from the server and writes `harvis.json`:
+deploy learns the name from the server and records it:
 
 ```bash
 harvis link --token <token-from-dashboard>
@@ -101,14 +98,14 @@ None of these remove your deploy tokens. To delete those too:
 rm -rf ~/.config/harvis
 ```
 
-(`%APPDATA%\harvis` on Windows, or wherever `XDG_CONFIG_HOME` / `HARVIS_CONFIG_DIR` points.) Tokens can also be regenerated from the dashboard, and `harvis.json` in a project is just the site name — delete it if you no longer want the project linked.
+(`%APPDATA%\harvis` on Windows, or wherever `XDG_CONFIG_HOME` / `HARVIS_CONFIG_DIR` points.) Tokens can also be regenerated from the dashboard.
 
 ## Notes
 
 - Uploads are zipped when the folder compresses well (HTML/CSS/JS shrink ~60-70%); folders that are mostly already-compressed media (images, video, fonts) upload as raw multipart instead. A progress bar is shown on interactive terminals.
 - Limits: 500 files, 50 MB per site. Hidden files and folders (anything starting with `.`, like `.env` or `.git`), `node_modules`, and OS junk files are skipped automatically.
 - **Unclaimed sites expire 24 hours after the last deploy.** Claim a site to keep it online permanently. If a linked site has expired, the next deploy tells you and creates a new one.
-- The deploy token is a secret and stays out of your project: it is written only to `~/.config/harvis/credentials.json`, mode `0600`. The `harvis.json` file in your project holds nothing but the site name and is safe to commit.
+- The deploy token is a secret and stays out of your project: it is written only to `~/.config/harvis/credentials.json`, mode `0600`.
 - The claim link is single-use and can't be recovered. If you want to keep the site, claim it before it expires.
 
 ## Development
